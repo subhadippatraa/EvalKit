@@ -183,8 +183,11 @@ Provider-agnostic helpers, shared by all current and future judges:
   `ClientError` / `BotoCoreError` → `JudgeError` (message includes AWS error
   code).
 - Credentials and region come from the standard AWS chain (`AWS_PROFILE`,
-  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, instance role…).
-  evalkit reads no AWS secrets itself.
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, instance
+  role…). evalkit reads no AWS secrets itself. Use `AWS_DEFAULT_REGION`, not
+  `AWS_REGION` — this botocore version's client-construction chain only reads
+  the latter inside a Lambda environment; found via a CI failure (`NoRegionError`)
+  that a local `~/.aws/config` default region had been masking.
 
 ## Structured judge-output contract
 
@@ -345,7 +348,7 @@ error (error row id printed when one was persisted), `2` usage error.
 | `EVALKIT_JUDGE_TEMPERATURE` | `0` | no | Judge temperature |
 | `EVALKIT_JUDGE_TIMEOUT` | `60` | no | Per-request timeout (seconds) |
 | `EVALKIT_DB_PATH` | `./evalkit.db` | no | SQLite path |
-| `AWS_REGION`, `AWS_PROFILE` / AWS credentials | AWS chain | via AWS chain | Read by boto3, `bedrock` provider only |
+| `AWS_DEFAULT_REGION`, `AWS_PROFILE` / AWS credentials | AWS chain | via AWS chain | Read by boto3, `bedrock` provider only; **not** `AWS_REGION` (unread outside Lambda) |
 | `EVALKIT_JUDGE_API_KEY` | — | **yes**, `bedrock-openai` only | API key for Bedrock's OpenAI-compatible gateway |
 | `EVALKIT_JUDGE_BASE_URL` | `bedrock_openai.DEFAULT_BASE_URL` | no | Override the gateway URL, `bedrock-openai` only |
 

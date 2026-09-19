@@ -232,6 +232,10 @@ def env(monkeypatch, tmp_path):
     ]:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("EVALKIT_DB_PATH", str(tmp_path / "env.db"))
+    # boto3's standard client-construction chain reads AWS_DEFAULT_REGION, not AWS_REGION
+    # (verified against the installed botocore; AWS_REGION is only consulted in a
+    # Lambda-specific code path) — set both so this test doesn't depend on that quirk.
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     return monkeypatch
 

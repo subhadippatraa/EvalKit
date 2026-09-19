@@ -56,7 +56,10 @@ evalkit does not load `.env` files; export the variables yourself, e.g.
 
 Uses `boto3`'s Bedrock Converse API with a forced tool call. AWS credentials and region
 come from the standard AWS chain (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,
-`AWS_REGION`, instance roles, …); evalkit never reads AWS secrets itself.
+`AWS_DEFAULT_REGION`, instance roles, …); evalkit never reads AWS secrets itself. Use
+`AWS_DEFAULT_REGION`, not `AWS_REGION` — boto3's client-construction chain only reads the
+latter inside a Lambda environment, so setting only `AWS_REGION` elsewhere fails with
+`NoRegionError` unless a region is also set in `~/.aws/config`.
 
 **Model requirement:** the judge forces a tool call (`toolChoice: {"tool": ...}`). Use a
 model family that supports forced tool choice (e.g. Anthropic Claude models on Bedrock) and
@@ -220,7 +223,7 @@ Exit codes:
 ## Full example: input → stored result
 
 ```bash
-export EVALKIT_JUDGE_MODEL=<bedrock-model-id> AWS_REGION=us-east-1 EVALKIT_DB_PATH=./evals.db
+export EVALKIT_JUDGE_MODEL=<bedrock-model-id> AWS_DEFAULT_REGION=us-east-1 EVALKIT_DB_PATH=./evals.db
 evalkit run --input input.json > result.json
 evalkit review "$(jq -r .id result.json)" --reviewer alice --verdict pass --score 0.9
 evalkit get "$(jq -r .id result.json)"
