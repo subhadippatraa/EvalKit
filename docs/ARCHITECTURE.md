@@ -1,6 +1,6 @@
 # evalkit — Architecture (v1)
 
-Status: **architecture final; implementation not yet approved.** Source of
+Status: **approved and implemented (v0.1.0).** Source of
 truth for requirements: `evalkit-prompt.md`. All open decisions are resolved
 (see [Resolved Decisions](#resolved-decisions)); references appear as **[OD-n]**.
 
@@ -36,25 +36,42 @@ pyproject.toml
 README.md
 docs/ARCHITECTURE.md
 src/evalkit/
-  __init__.py    # public exports
-  models.py      # Criterion, Rubric (+ .score()), CriterionScore, EvaluationResult, Review
-  errors.py      # error hierarchy
-  judge.py       # Judge Protocol, PROMPT_TEMPLATE, render_prompt(), output_schema(), PROMPT_VERSION  (no SDK imports)
-  bedrock.py     # BedrockJudge — the only module that imports boto3/botocore
-  store.py       # Store Protocol, SQLiteStore
-  evaluator.py   # Evaluator (+ from_env): orchestration, retry, persistence
-  cli.py         # argparse entry point `evalkit`
+  __init__.py       # public exports
+  models.py         # Criterion, Rubric (+ .score()), CriterionScore, EvaluationResult, Review
+  errors.py         # error hierarchy
+  judge.py          # Judge Protocol, PROMPT_TEMPLATE, render_prompt(), output_schema(), PROMPT_VERSION  (no SDK imports)
+  bedrock.py        # BedrockJudge — the only module that imports boto3/botocore
+  bedrock_openai.py # BedrockOpenAIJudge — the only module that imports openai (added post-v1, see below)
+  store.py          # Store Protocol, SQLiteStore
+  evaluator.py      # Evaluator (+ from_env): orchestration, retry, persistence
+  cli.py            # argparse entry point `evalkit`
 tests/
-  test_models.py test_evaluator.py test_bedrock.py test_store.py test_cli.py test_e2e.py
+  test_models.py test_evaluator.py test_bedrock.py test_bedrock_openai.py test_store.py
+  test_cli.py test_e2e.py
 ```
 
 - Only two Protocols (`Judge`, `Store`). No registry, factory, provider
   manager, or plugin system.
-- `evaluator.py` depends only on the `Judge` Protocol. The single place that
-  names `BedrockJudge` is `Evaluator.from_env()`, which imports `bedrock`
-  lazily inside the function.
-- Future providers (`AnthropicJudge`, `OpenAIJudge`) are **not** created in v1;
-  each would be one new module like `bedrock.py`, reusing `judge.py`.
+- `evaluator.py` depends only on the `Judge` Protocol. `Evaluator.from_env()`
+  is the single place that names a concrete judge class, chosen by
+  `EVALKIT_JUDGE_PROVIDER`; each provider module is imported lazily, only when
+  selected, so its SDK is never a hard dependency of the core.
+- A future provider (e.g. `AnthropicJudge`) is one more module like
+  `bedrock.py`/`bedrock_openai.py`, reusing `judge.py`.
+
+### Addition beyond original v1 scope: `bedrock-openai` provider
+
+The original v1 scope (and [OD-6](#resolved-decisions)) said "v1 implements
+only `BedrockJudge`". A second judge, `BedrockOpenAIJudge`, was added on
+explicit request to reach Bedrock through its OpenAI-compatible gateway
+(chat completions + forced function calling) instead of the boto3 Converse
+API — needed because this account's boto3 `Converse` calls were blocked
+(`ValidationException: Operation not allowed`) while the gateway path works.
+It follows the same isolation rule as `bedrock.py`: it is the only module
+that imports `openai`, it reuses the shared prompt/schema/version from
+`judge.py`, and `openai` is an optional install extra (`evalkit[bedrock-openai]`),
+not a core dependency. No registry was added — `Evaluator.from_env()` just
+branches on `EVALKIT_JUDGE_PROVIDER` between the two.
 
 ## Public API
 
@@ -63,13 +80,13 @@ Exports from `evalkit`: `Evaluator`, `Rubric`, `Criterion`, `EvaluationResult`,
 
 ```python
 class Evaluator:
-    def __init__(self, judge: Judge, store: Store | None = None): ...
+    def __init__(self, judge: Judge | None, store: Store | None = None): ...
     @classmethod
-    def from_env(cls) -> "Evaluator": ...          # BedrockJudge + SQLiteStore
+    def from_env(cls, *, with_judge: bool = True) -> "Evaluator": ...  # BedrockJudge + SQLiteStore
     def evaluate(self, prompt: str, model_output: str,
                  reference_output: str | None = None,
                  criteria: dict[str, str] | None = None,
-                 rubric: Rubric | None = None,
+                 rubric: Rubric | dict | None = None,
                  metadata: dict | None = None,
                  tags: list[str] | None = None) -> EvaluationResult: ...
     def review(self, evaluation_id: str, reviewer: str, verdict: str,
@@ -81,6 +98,12 @@ class Evaluator:
 - Exactly one of `criteria` / `rubric` is required; otherwise `RubricError`.
 - `store=None` disables persistence. `review`/`get`/`list` then raise
   `ConfigError`. `from_env()` always attaches `SQLiteStore`.
+- `rubric` may be a `Rubric` or its dict form (as used by the CLI input file).
+- `judge=None` gives a store-only evaluator (`get`/`list`/`review`); `evaluate`
+  then raises `ConfigError`. `from_env(with_judge=False)` builds one without
+  requiring `EVALKIT_JUDGE_MODEL` or AWS configuration. The CLI uses it for
+  `get`/`list`/`review`, so those commands need only `EVALKIT_DB_PATH`.
+  *(Added during implementation.)*
 - `BedrockJudge` is importable as `evalkit.bedrock.BedrockJudge` for explicit
   construction; it is not a top-level export.
 
@@ -300,8 +323,8 @@ CREATE INDEX idx_reviews_evaluation_id ON reviews(evaluation_id);
 ## CLI design
 
 `argparse`, entry point `evalkit = evalkit.cli:main`. Each command builds an
-`Evaluator` via `from_env()` and makes one library call; output is JSON on
-stdout.
+`Evaluator` via `from_env()` (`with_judge=False` for `get`/`list`/`review`) and
+makes one library call; output is JSON on stdout.
 
 | Command | Library call |
 |---|---|
@@ -317,12 +340,14 @@ error (error row id printed when one was persisted), `2` usage error.
 
 | Variable | Default | Required by `from_env()` | Purpose |
 |---|---|---|---|
-| `EVALKIT_JUDGE_PROVIDER` | `bedrock` | no | Only `bedrock` accepted in v1; anything else → `ConfigError` |
-| `EVALKIT_JUDGE_MODEL` | — | **yes** [OD-6] | Bedrock model ID / inference profile ID |
+| `EVALKIT_JUDGE_PROVIDER` | `bedrock` | no | `bedrock` or `bedrock-openai` (§ below); anything else → `ConfigError` |
+| `EVALKIT_JUDGE_MODEL` | — | **yes** [OD-6] | Model ID/name for the chosen provider |
 | `EVALKIT_JUDGE_TEMPERATURE` | `0` | no | Judge temperature |
 | `EVALKIT_JUDGE_TIMEOUT` | `60` | no | Per-request timeout (seconds) |
 | `EVALKIT_DB_PATH` | `./evalkit.db` | no | SQLite path |
-| `AWS_REGION`, `AWS_PROFILE` / AWS credentials | AWS chain | via AWS chain | Read by boto3, not by evalkit |
+| `AWS_REGION`, `AWS_PROFILE` / AWS credentials | AWS chain | via AWS chain | Read by boto3, `bedrock` provider only |
+| `EVALKIT_JUDGE_API_KEY` | — | **yes**, `bedrock-openai` only | API key for Bedrock's OpenAI-compatible gateway |
+| `EVALKIT_JUDGE_BASE_URL` | `bedrock_openai.DEFAULT_BASE_URL` | no | Override the gateway URL, `bedrock-openai` only |
 
 - Missing `EVALKIT_JUDGE_MODEL` or unparsable numbers → `ConfigError`.
 - `.env.example` documents these with placeholder values; no secrets
@@ -332,7 +357,9 @@ error (error row id printed when one was persisted), `2` usage error.
 ## Dependencies
 
 - Runtime: `pydantic>=2`, `boto3`.
-- Dev: `pytest`, `ruff`.
+- Optional extra `bedrock-openai`: `openai>=1.50`, only for that provider.
+- Dev: `pytest`, `ruff`, `openai` (so `bedrock-openai` tests can run against a
+  fake client without a real account).
 - Stdlib for everything else: `argparse`, `sqlite3`, `hashlib`, `uuid`, `json`.
 
 ## Testing strategy
@@ -417,3 +444,42 @@ the pytest suite.
   `JudgeOutputError`.
 - Retrying an identical request at temperature 0 may reproduce the same
   malformed output; accepted for v1 [OD-5].
+- Truncated judge output (`stopReason=max_tokens`) is still retried once, like
+  any other malformed output, even though the identical retry will usually
+  truncate again too. Left as-is to keep the retry rule uniform per [OD-5]
+  rather than carve out a silent exception; a very large rubric is the only
+  way to hit this.
+- `judge_prompt_version` hashes the prompt template and tool definition only,
+  not provider-specific request parameters (e.g. Bedrock's `MAX_TOKENS`).
+  Schema *shape* doesn't need to be included: it's a deterministic function of
+  the rubric, which is already versioned separately via `rubric_version`.
+
+### Post-review hardening (implementation)
+
+Found during a repository review after initial implementation, fixed without
+changing approved design:
+
+- **`SQLiteStore` is now safe to share across threads.** The connection is
+  opened with `check_same_thread=False` and every call is serialized through
+  one `threading.Lock`. A bare `sqlite3.connect()` raised `ProgrammingError`
+  the moment a second thread called it, which would lose an already-paid-for
+  judge result.
+- **`Criterion.name` is restricted to `^[A-Za-z0-9_-]{1,64}$`.** A name is
+  used verbatim as a tool-schema property name; anything else (spaces,
+  slashes, >64 chars) is rejected as `RubricError` before the judge is called,
+  instead of surfacing later as a Bedrock `ValidationException`.
+- **`render_prompt` escapes `<`/`>` in `prompt`, `model_output` and
+  `reference_output`.** Evaluated content containing a literal closing tag
+  (e.g. `</model_output>` followed by injected instructions) can no longer
+  break out of its section and add fake instructions to the judge prompt.
+- **`SQLiteStore.list()` now loads each row's reviews**, matching `get()`,
+  instead of always returning `reviews: []`.
+- **A storage failure while persisting a judge-stage error no longer hides
+  that error.** `Evaluator.evaluate()` chains the storage exception's `__cause__`
+  to the original judge error before letting it propagate (still a plain
+  exception per the architecture's failure table, just no longer silently
+  losing context).
+- **CLI:** `run` checks the input file's keys against `evaluate()`'s
+  parameters up front (clearer error than a bare `TypeError`), and
+  `list --limit` rejects non-positive values instead of silently returning
+  every row (SQLite treats `LIMIT -1` as "no limit").
