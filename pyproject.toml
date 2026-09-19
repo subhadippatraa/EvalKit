@@ -21,6 +21,7 @@ bedrock-openai = [
 dev = [
     "pytest>=8",
     "ruff>=0.6",
+    "openai>=1.50",
 ]
 
 [build-system]
