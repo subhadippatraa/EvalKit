@@ -45,6 +45,22 @@ def test_success_is_scored_and_persisted(store):
     assert store.get(result.id) == result
 
 
+def test_context_flows_through_to_judge_and_is_persisted(store):
+    judge = FakeJudge(judged(correctness=5, clarity=5))
+    result = run(Evaluator(judge, store), context="Passwords must be at least 12 characters.")
+    assert result.context == "Passwords must be at least 12 characters."
+    assert judge.calls[0][3] == "Passwords must be at least 12 characters."
+    assert store.get(result.id).context == "Passwords must be at least 12 characters."
+
+
+def test_context_defaults_to_none_for_existing_callers(store):
+    judge = FakeJudge(judged(correctness=5, clarity=5))
+    result = run(Evaluator(judge, store))  # no context kwarg -- existing call shape
+    assert result.context is None
+    assert judge.calls[0][3] is None
+    assert store.get(result.id).context is None
+
+
 def test_explicit_rubric_object_and_dict(store):
     rubric = Rubric(
         criteria=[Criterion(name="acc", description="Accurate?", scale=(0, 10), weight=2)],

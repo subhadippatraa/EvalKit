@@ -34,6 +34,15 @@ def test_save_get_roundtrip(store):
     assert store.get(r.id) == r
 
 
+def test_context_roundtrips_and_defaults_to_none(store):
+    with_context = result(context="supporting material")
+    without_context = result()
+    store.save(with_context)
+    store.save(without_context)
+    assert store.get(with_context.id).context == "supporting material"
+    assert store.get(without_context.id).context is None
+
+
 def test_error_row_roundtrip(store):
     r = result(
         status="error", error="JudgeError: boom", scores={}, overall_score=None, verdict=None

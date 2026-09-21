@@ -85,6 +85,7 @@ class Evaluator:
     def from_env(cls, *, with_judge: bool = True) -> "Evaluator": ...  # BedrockJudge + SQLiteStore
     def evaluate(self, prompt: str, model_output: str,
                  reference_output: str | None = None,
+                 context: str | None = None,
                  criteria: dict[str, str] | None = None,
                  rubric: Rubric | dict | None = None,
                  metadata: dict | None = None,
@@ -106,6 +107,14 @@ class Evaluator:
   *(Added during implementation.)*
 - `BedrockJudge` is importable as `evalkit.bedrock.BedrockJudge` for explicit
   construction; it is not a top-level export.
+- `context`: optional supporting material the model output may be checked
+  against (e.g. source documents, a spec, background text) -- distinct from
+  `reference_output` (a gold *answer*, not grounding material). Rendered into
+  its own `<context>` prompt block, escaped the same way as `model_output`/
+  `reference_output`; omitted (`None`) renders as a fixed placeholder so the
+  prompt shape stays stable either way. Persisted on `EvaluationResult` for
+  the same auditability reason `reference_output` is. *(Added during
+  implementation, generic scope -- not domain-specific.)*
 
 ## Pydantic / domain models (`models.py`)
 
@@ -114,7 +123,7 @@ class Evaluator:
 | `Criterion` | `name: str`, `description: str`, `scale: tuple[int, int] = (1, 5)`, `weight: float = 1.0` |
 | `Rubric` | `criteria: list[Criterion]`, `threshold: float = 0.75`, `version: str \| None` |
 | `CriterionScore` | `reasoning: str`, `score: int` (field order: reasoning first) |
-| `EvaluationResult` | `id`, `created_at`, `status: "ok" \| "error"`, `error: str \| None`, `prompt`, `model_output`, `reference_output`, `rubric`, `rubric_version`, `judge_provider`, `judge_model`, `judge_temperature`, `judge_prompt_version`, `scores: dict[str, CriterionScore]`, `overall_score: float \| None` (0–1), `verdict: "PASS" \| "FAIL" \| None`, `latency_ms`, `metadata: dict`, `tags: list[str]`, `reviews: list[Review]` (populated on `get`) |
+| `EvaluationResult` | `id`, `created_at`, `status: "ok" \| "error"`, `error: str \| None`, `prompt`, `model_output`, `reference_output`, `context`, `rubric`, `rubric_version`, `judge_provider`, `judge_model`, `judge_temperature`, `judge_prompt_version`, `scores: dict[str, CriterionScore]`, `overall_score: float \| None` (0–1), `verdict: "PASS" \| "FAIL" \| None`, `latency_ms`, `metadata: dict`, `tags: list[str]`, `reviews: list[Review]` (populated on `get`) |
 | `Review` | `id`, `evaluation_id`, `reviewer: str`, `verdict: "PASS" \| "FAIL"`, `score: float \| None` in `[0, 1]` **[OD-2]**, `comment: str \| None`, `created_at` |
 
 IDs: uuid4 strings. Timestamps: ISO-8601 UTC.
@@ -141,8 +150,8 @@ class Judge(Protocol):
     model: str             # provider-specific model id, opaque to the core
     temperature: float
     prompt_version: str
-    def judge(self, prompt: str, model_output: str,
-              reference_output: str | None, rubric: Rubric) -> dict[str, Any]: ...
+    def judge(self, prompt: str, model_output: str, reference_output: str | None,
+              context: str | None, rubric: Rubric) -> dict[str, Any]: ...
 ```
 
 Contract for any implementation:
@@ -156,11 +165,11 @@ Contract for any implementation:
 
 Provider-agnostic helpers, shared by all current and future judges:
 
-- `PROMPT_TEMPLATE`: instructions + prompt, model output, optional reference
-  output, criterion descriptions with scales.
-- `render_prompt(prompt, model_output, reference_output, rubric) -> str`.
+- `PROMPT_TEMPLATE`: instructions + prompt, model output, optional context,
+  optional reference output, criterion descriptions with scales.
+- `render_prompt(prompt, model_output, reference_output, context, rubric) -> str`.
 - `output_schema(rubric) -> dict`: the JSON Schema below.
-- `PROMPT_VERSION = sha256(PROMPT_TEMPLATE + TOOL_NAME + TOOL_DESCRIPTION)[:12]`.
+- `PROMPT_VERSION = sha256(PROMPT_TEMPLATE + NO_REFERENCE + NO_CONTEXT + TOOL_NAME + TOOL_DESCRIPTION)[:12]`.
 
 ## Bedrock judge integration (`bedrock.py`)
 
@@ -267,6 +276,7 @@ CREATE TABLE evaluations (
   prompt               TEXT NOT NULL,
   model_output         TEXT NOT NULL,
   reference_output     TEXT,
+  context              TEXT,
   rubric_json          TEXT NOT NULL,
   rubric_version       TEXT NOT NULL,
   judge_provider       TEXT NOT NULL,

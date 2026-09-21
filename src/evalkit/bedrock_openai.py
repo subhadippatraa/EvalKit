@@ -56,7 +56,12 @@ class BedrockOpenAIJudge:
         )
 
     def judge(
-        self, prompt: str, model_output: str, reference_output: str | None, rubric: Rubric
+        self,
+        prompt: str,
+        model_output: str,
+        reference_output: str | None,
+        context: str | None,
+        rubric: Rubric,
     ) -> dict[str, Any]:
         try:
             response = self._client.chat.completions.create(
@@ -65,7 +70,9 @@ class BedrockOpenAIJudge:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": render_prompt(prompt, model_output, reference_output, rubric),
+                        "content": render_prompt(
+                            prompt, model_output, reference_output, context, rubric
+                        ),
                     },
                 ],
                 tools=[

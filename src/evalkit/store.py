@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
   prompt               TEXT NOT NULL,
   model_output         TEXT NOT NULL,
   reference_output     TEXT,
+  context              TEXT,
   rubric_json          TEXT NOT NULL,
   rubric_version       TEXT NOT NULL,
   judge_provider       TEXT NOT NULL,
@@ -76,7 +77,7 @@ class SQLiteStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO evaluations VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     result.id,
                     result.created_at.isoformat(),
@@ -85,6 +86,7 @@ class SQLiteStore:
                     result.prompt,
                     result.model_output,
                     result.reference_output,
+                    result.context,
                     result.rubric.model_dump_json(),
                     result.rubric_version,
                     result.judge_provider,

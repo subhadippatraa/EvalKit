@@ -104,6 +104,7 @@ try:
         prompt="Explain dependency injection in .NET.",
         model_output="DI in .NET is built into Microsoft.Extensions.DependencyInjection ...",
         reference_output="Constructor injection via IServiceCollection ...",  # optional
+        context=None,  # optional: supporting material the model output may rely on
         criteria={"correctness": "Is it factually correct?", "clarity": "Is it clear?"},
         metadata={"app": "ragforge", "app_version": "1.4.2", "model": "gpt-x"},
         tags=["regression-suite"],
@@ -240,6 +241,7 @@ The output looks like this. The values are illustrative.
   "prompt": "Explain dependency injection in .NET.",
   "model_output": "DI in .NET is built into Microsoft.Extensions.DependencyInjection ...",
   "reference_output": null,
+  "context": null,
   "rubric": {
     "criteria": [
       {"name": "correctness", "description": "Is it factually correct?", "scale": [1, 5], "weight": 1.0},
@@ -289,11 +291,11 @@ Per-criterion scores, metadata and tags are stored as JSON columns. See
 The core depends only on two Protocols, so an extension is one new module. No registration
 is needed.
 
-**Judge** (`evalkit.judge.Judge`): expose `provider`, `model`, `temperature`,
-`prompt_version`, and implement
+**Judge** (`evalkit.judge.Judge`, also exported as `evalkit.Judge`): expose `provider`,
+`model`, `temperature`, `prompt_version`, and implement
 
 ```python
-def judge(self, prompt, model_output, reference_output, rubric) -> dict: ...
+def judge(self, prompt, model_output, reference_output, context, rubric) -> dict: ...
 ```
 
 Rules:

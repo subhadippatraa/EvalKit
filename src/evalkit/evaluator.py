@@ -68,6 +68,7 @@ class Evaluator:
         prompt: str,
         model_output: str,
         reference_output: str | None = None,
+        context: str | None = None,
         criteria: dict[str, str] | None = None,
         rubric: Rubric | dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
@@ -92,6 +93,7 @@ class Evaluator:
                 prompt=prompt,
                 model_output=model_output,
                 reference_output=reference_output,
+                context=context,
                 rubric=rubric,
                 rubric_version=rubric.version,
                 judge_provider=judge.provider,
@@ -109,7 +111,7 @@ class Evaluator:
         start = time.perf_counter()
         for _ in range(2):
             try:
-                raw = judge.judge(prompt, model_output, reference_output, rubric)
+                raw = judge.judge(prompt, model_output, reference_output, context, rubric)
                 result.scores, result.overall_score, result.verdict = rubric.score(raw)
                 error = None
                 break

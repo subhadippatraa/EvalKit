@@ -49,7 +49,12 @@ class BedrockJudge:
         self._client = client
 
     def judge(
-        self, prompt: str, model_output: str, reference_output: str | None, rubric: Rubric
+        self,
+        prompt: str,
+        model_output: str,
+        reference_output: str | None,
+        context: str | None,
+        rubric: Rubric,
     ) -> dict[str, Any]:
         try:
             response = self._client.converse(
@@ -59,7 +64,11 @@ class BedrockJudge:
                     {
                         "role": "user",
                         "content": [
-                            {"text": render_prompt(prompt, model_output, reference_output, rubric)}
+                            {
+                                "text": render_prompt(
+                                    prompt, model_output, reference_output, context, rubric
+                                )
+                            }
                         ],
                     }
                 ],

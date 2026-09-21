@@ -22,8 +22,8 @@ class FakeJudge:
         self.responses = list(responses)
         self.calls = []
 
-    def judge(self, prompt, model_output, reference_output, rubric):
-        self.calls.append((prompt, model_output, reference_output, rubric))
+    def judge(self, prompt, model_output, reference_output, context, rubric):
+        self.calls.append((prompt, model_output, reference_output, context, rubric))
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response

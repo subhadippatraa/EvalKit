@@ -125,6 +125,7 @@ class EvaluationResult(BaseModel):
     prompt: str
     model_output: str
     reference_output: str | None = None
+    context: str | None = None
     rubric: Rubric
     rubric_version: str
     judge_provider: str
