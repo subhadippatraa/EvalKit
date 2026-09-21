@@ -160,6 +160,9 @@ rubric = Rubric(
                   scale=(1, 5), weight=3),
         Criterion(name="cites_sources", description="Does it cite a source?", scale=(0, 1)),
         Criterion(name="tone", description="Is the tone professional?", scale=(1, 10)),
+        # a categorical judgment instead of a Likert scale: exactly one of `scale`/`labels`
+        Criterion(name="support", description="Is the claim supported by the source?",
+                  labels=("CONTRADICTED", "NOT_ADDRESSED", "SUPPORTED")),
     ],
     threshold=0.8,
     version="rag-v2",   # optional; defaults to a 12-char content hash
@@ -169,10 +172,13 @@ result = evaluator.evaluate(prompt=..., model_output=..., rubric=rubric)
 
 Scoring, done entirely in Python:
 
-1. Output is validated **strictly**. Every criterion must be present, with no extra ones,
-   non-empty `reasoning`, and an **integer** score within the criterion's scale. `"4"`,
-   `4.0` and `true` are rejected.
-2. Each score is normalized to 0–1: `(score − min) / (max − min)`.
+1. Output is validated **strictly**. Every criterion must be present, with no extra ones, and
+   non-empty `reasoning`. A `scale` criterion needs an **integer** `score` within its scale
+   (`"4"`, `4.0` and `true` are rejected); a `labels` criterion needs a `label` that's exactly
+   one of its declared values.
+2. Each score is normalized to 0–1: a `scale` criterion as `(score − min) / (max − min)`; a
+   `labels` criterion by the label's position in the declared (worst → best) order, the same
+   way: `index / (len(labels) − 1)`.
 3. `overall_score = Σ weightᵢ·normᵢ / Σ weightᵢ`.
 4. `verdict = "PASS" if overall_score >= threshold else "FAIL"`.
 

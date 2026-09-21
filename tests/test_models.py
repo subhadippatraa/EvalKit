@@ -9,6 +9,11 @@ def rubric(*criteria: Criterion, threshold: float = 0.75) -> Rubric:
     return Rubric(criteria=list(criteria), threshold=threshold)
 
 
+def labeled(**labels: str) -> dict:
+    """Raw judge payload for the given label-based criterion values."""
+    return {name: {"reasoning": f"{name} looks fine", "label": lab} for name, lab in labels.items()}
+
+
 # --- validation ---------------------------------------------------------------
 
 
@@ -142,3 +147,129 @@ def test_threshold_boundary():
 def test_malformed_output_rejected(raw):
     with pytest.raises(JudgeOutputError):
         Rubric.from_dict({"a": "A", "b": "B"}).score(raw)
+
+
+# --- label-based criteria -------------------------------------------------------
+
+
+def test_valid_label_criterion():
+    c = Criterion(
+        name="support",
+        description="Supported?",
+        labels=("CONTRADICTED", "NOT_ADDRESSED", "SUPPORTED"),
+    )
+    assert c.labels == ("CONTRADICTED", "NOT_ADDRESSED", "SUPPORTED")
+    assert c.scale is None
+
+
+def test_invalid_scale_and_labels_together():
+    with pytest.raises(ValidationError, match="cannot set both"):
+        Criterion(name="a", description="d", scale=(1, 5), labels=("LOW", "HIGH"))
+
+
+def test_neither_scale_nor_labels_defaults_to_the_pre_labels_scale():
+    # Backward compatibility: a criterion that names neither must behave exactly like
+    # before `labels` existed, not become an error -- every existing caller (including
+    # Rubric.from_dict) relies on this default.
+    c = Criterion(name="a", description="d")
+    assert c.scale == (1, 5) and c.labels is None
+
+
+def test_labels_require_at_least_two_entries():
+    with pytest.raises(ValidationError, match="at least 2"):
+        Criterion(name="a", description="d", labels=("ONLY_ONE",))
+
+
+def test_labels_must_be_unique():
+    with pytest.raises(ValidationError, match="unique"):
+        Criterion(name="a", description="d", labels=("LOW", "HIGH", "LOW"))
+
+
+def test_criterion_score_requires_exactly_one_of_score_or_label():
+    from evalkit.models import CriterionScore
+
+    CriterionScore(reasoning="r", score=4)
+    CriterionScore(reasoning="r", label="HIGH")
+    with pytest.raises(ValidationError):
+        CriterionScore(reasoning="r")
+    with pytest.raises(ValidationError):
+        CriterionScore(reasoning="r", score=4, label="HIGH")
+
+
+def test_invalid_returned_label_is_rejected():
+    r = rubric(Criterion(name="support", description="S", labels=("LOW", "MID", "HIGH")))
+    with pytest.raises(JudgeOutputError, match="not one of"):
+        r.score(labeled(support="EXTREME"))
+
+
+def test_label_criterion_rejects_a_numeric_score_and_vice_versa():
+    label_rubric = rubric(Criterion(name="support", description="S", labels=("LOW", "HIGH")))
+    with pytest.raises(JudgeOutputError, match="expects a label"):
+        label_rubric.score(judged(support=1))
+
+    numeric_rubric = Rubric.from_dict({"a": "A"})
+    with pytest.raises(JudgeOutputError, match="expects a numeric score"):
+        numeric_rubric.score(labeled(a="HIGH"))
+
+
+def test_label_normalization_by_ordinal_position():
+    r = rubric(Criterion(name="support", description="S", labels=("LOW", "MID", "HIGH")))
+    assert r.score(labeled(support="LOW"))[1] == 0.0
+    assert r.score(labeled(support="MID"))[1] == 0.5
+    assert r.score(labeled(support="HIGH"))[1] == 1.0
+
+
+def test_label_normalization_with_weights():
+    r = rubric(
+        Criterion(name="a", description="A", labels=("LOW", "HIGH"), weight=3),
+        Criterion(name="b", description="B", labels=("LOW", "HIGH"), weight=1),
+    )
+    _, overall, _ = r.score(labeled(a="HIGH", b="LOW"))  # (3*1 + 1*0) / 4
+    assert overall == 0.75
+
+
+def test_mixed_numeric_and_label_criteria():
+    r = rubric(
+        Criterion(name="clarity", description="C"),  # default scale (1, 5)
+        Criterion(
+            name="support", description="S", labels=("CONTRADICTED", "NOT_ADDRESSED", "SUPPORTED")
+        ),
+    )
+    scores, overall, verdict = r.score(
+        {
+            "clarity": {"reasoning": "clear enough", "score": 5},
+            "support": {"reasoning": "matches the source", "label": "SUPPORTED"},
+        }
+    )
+    assert overall == 1.0 and verdict == "PASS"
+    assert scores["clarity"].score == 5 and scores["clarity"].label is None
+    assert scores["support"].label == "SUPPORTED" and scores["support"].score is None
+
+
+def test_label_schema_emits_enum():
+    from evalkit.judge import output_schema
+
+    r = rubric(Criterion(name="support", description="S", labels=("LOW", "HIGH")))
+    schema = output_schema(r)
+    item = schema["properties"]["support"]
+    assert list(item["properties"]) == ["reasoning", "label"]
+    assert item["properties"]["label"] == {"type": "string", "enum": ["LOW", "HIGH"]}
+    assert item["required"] == ["reasoning", "label"]
+
+
+def test_numeric_schema_is_unchanged_by_label_support():
+    from evalkit.judge import output_schema
+
+    r = Rubric.from_dict({"a": "A"})
+    schema = output_schema(r)
+    item = schema["properties"]["a"]
+    assert list(item["properties"]) == ["reasoning", "score"]
+    assert item["properties"]["score"] == {"type": "integer", "minimum": 1, "maximum": 5}
+
+
+def test_backward_compatible_numeric_only_rubric_is_unaffected():
+    # The exact pre-labels API shape still works with no changes required.
+    r = Rubric.from_dict({"a": "A?", "b": "B?"})
+    scores, overall, verdict = r.score(judged(a=5, b=3))
+    assert overall == 0.75 and verdict == "PASS"
+    assert scores["a"].score == 5 and scores["a"].label is None

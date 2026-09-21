@@ -120,9 +120,9 @@ class Evaluator:
 
 | Model | Fields |
 |---|---|
-| `Criterion` | `name: str`, `description: str`, `scale: tuple[int, int] = (1, 5)`, `weight: float = 1.0` |
+| `Criterion` | `name: str`, `description: str`, `scale: tuple[int, int] \| None`, `labels: tuple[str, ...] \| None` (exactly one of `scale`/`labels` ends up set -- both omitted defaults to `scale=(1, 5)`, the pre-`labels` behavior), `weight: float = 1.0` |
 | `Rubric` | `criteria: list[Criterion]`, `threshold: float = 0.75`, `version: str \| None` |
-| `CriterionScore` | `reasoning: str`, `score: int` (field order: reasoning first) |
+| `CriterionScore` | `reasoning: str`, `score: int \| None`, `label: str \| None` (exactly one of `score`/`label` set; field order: reasoning first) |
 | `EvaluationResult` | `id`, `created_at`, `status: "ok" \| "error"`, `error: str \| None`, `prompt`, `model_output`, `reference_output`, `context`, `rubric`, `rubric_version`, `judge_provider`, `judge_model`, `judge_temperature`, `judge_prompt_version`, `scores: dict[str, CriterionScore]`, `overall_score: float \| None` (0–1), `verdict: "PASS" \| "FAIL" \| None`, `latency_ms`, `metadata: dict`, `tags: list[str]`, `reviews: list[Review]` (populated on `get`) |
 | `Review` | `id`, `evaluation_id`, `reviewer: str`, `verdict: "PASS" \| "FAIL"`, `score: float \| None` in `[0, 1]` **[OD-2]**, `comment: str \| None`, `created_at` |
 
