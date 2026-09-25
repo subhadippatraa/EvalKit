@@ -33,7 +33,7 @@ any_float = st.floats(allow_nan=True, allow_infinity=True)  # includes nan, +-in
 BAD_NUMBERS = [float("nan"), float("inf"), float("-inf")]
 
 
-# --- construction rejects non-finite / out-of-range numbers -------------------------------
+# --- construction rejects non-finite / out-of-range numbers ----------------------------------
 
 
 @pytest.mark.parametrize(
@@ -82,7 +82,7 @@ def test_metadata_with_nan_is_rejected(store):
         )
 
 
-# --- Rubric.score: finite, in range, or a typed error -------------------------------------
+# --- Rubric.score: finite, in range, or a typed error ----------------------------------------
 
 
 def _payload(rubric, score_for):
@@ -206,7 +206,7 @@ def test_property_huge_integers_never_overflow(lo, span, score):
     assert lo <= score <= lo + span and 0.0 <= overall <= 1.0
 
 
-# --- coherence of stored/returned results --------------------------------------------------
+# --- coherence of stored/returned results ----------------------------------------------------
 
 _RUBRIC = Rubric.from_dict({"a": "A?"})
 _OK = dict(
@@ -274,7 +274,7 @@ def test_incoherent_error_results_are_rejected(overrides):
         EvaluationResult(**(base | overrides))
 
 
-# --- the database refuses incoherent rows even if Python were bypassed ---------------------
+# --- the database refuses incoherent rows even if Python were bypassed -----------------------
 
 _ROW = dict(
     id="x",
@@ -357,7 +357,7 @@ def test_a_corrupt_legacy_row_is_reported_not_silently_returned(store):
         store.list()
 
 
-# --- non-finite configuration --------------------------------------------------------------
+# --- non-finite configuration ----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(

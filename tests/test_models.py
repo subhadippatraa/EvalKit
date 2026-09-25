@@ -14,7 +14,7 @@ def labeled(**labels: str) -> dict:
     return {name: {"reasoning": f"{name} looks fine", "label": lab} for name, lab in labels.items()}
 
 
-# --- validation ---------------------------------------------------------------
+# --- validation ------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -79,7 +79,7 @@ def test_review_score_range():
         Review(evaluation_id="e", reviewer="r", verdict="MAYBE")
 
 
-# --- scoring ------------------------------------------------------------------
+# --- scoring ---------------------------------------------------------------------------------
 
 
 def test_normalization_equal_weights():
@@ -120,7 +120,7 @@ def test_threshold_boundary():
     assert overall < 0.75 and verdict == "FAIL"
 
 
-# --- malformed judge output ---------------------------------------------------
+# --- malformed judge output ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -149,7 +149,7 @@ def test_malformed_output_rejected(raw):
         Rubric.from_dict({"a": "A", "b": "B"}).score(raw)
 
 
-# --- label-based criteria -------------------------------------------------------
+# --- label-based criteria --------------------------------------------------------------------
 
 
 def test_valid_label_criterion():

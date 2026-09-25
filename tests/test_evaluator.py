@@ -24,7 +24,7 @@ def only_row(store):
     return store.get(row.id)
 
 
-# --- success ------------------------------------------------------------------
+# --- success ---------------------------------------------------------------------------------
 
 
 def test_success_is_scored_and_persisted(store):
@@ -78,7 +78,7 @@ def test_works_without_store():
     assert result.verdict == "FAIL"
 
 
-# --- invalid input: RubricError, judge not called, nothing persisted -----------
+# --- invalid input: RubricError, judge not called, nothing persisted -------------------------
 
 
 @pytest.mark.parametrize(
@@ -107,7 +107,7 @@ def test_invalid_input(store, overrides):
     assert store.list() == []
 
 
-# --- retry semantics ------------------------------------------------------------
+# --- retry semantics -------------------------------------------------------------------------
 
 
 def test_malformed_then_valid_retries_once(store):
@@ -175,7 +175,7 @@ def test_error_without_store_has_no_evaluation_id():
     assert info.value.evaluation_id is None
 
 
-# --- human review ---------------------------------------------------------------
+# --- human review ----------------------------------------------------------------------------
 
 
 def test_multiple_reviews(store):
@@ -233,7 +233,7 @@ def test_evaluate_requires_judge(store):
         run(Evaluator(None, store))
 
 
-# --- from_env ---------------------------------------------------------------------
+# --- from_env --------------------------------------------------------------------------------
 
 
 @pytest.fixture

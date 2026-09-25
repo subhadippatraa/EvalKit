@@ -22,6 +22,13 @@ MAX_REVIEWER_CHARS = 128
 MAX_INPUT_FILE_BYTES = 8 * 1024 * 1024  # CLI `run --input`
 MAX_LIST_LIMIT = 10_000
 
+MAX_JSONL_LINE_BYTES = 4 * 1024 * 1024  # one dataset line; > max_case_bytes to allow JSON escapes
+MAX_JSON_DEPTH = 32  # nesting depth of free-form case metadata
+MAX_DOC_ID_CHARS = 256  # retrieved / relevance document ids
+MAX_DOC_IDS = 1000  # per case
+MAX_RELEVANCE_GRADE = 100
+MAX_ISSUES = 100  # validation problems reported before an import gives up scanning
+
 MAX_EVIDENCE_BYTES = 64 * 1024  # raw judge output kept per failed attempt
 MAX_ERROR_CHARS = 2000
 
@@ -33,6 +40,8 @@ class Limits:
     max_field_bytes: int = 256 * 1024  # each of prompt / model_output / reference_output / context
     max_metadata_bytes: int = 16 * 1024  # JSON-encoded
     max_tags: int = 32
+    max_case_bytes: int = 1024 * 1024  # a whole dataset case, UTF-8 bytes
+    max_import_cases: int = 5_000_000
 
 
 def truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:

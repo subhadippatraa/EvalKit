@@ -3,12 +3,16 @@
 import argparse
 import inspect
 import json
+import os
 import sqlite3
 import sys
+from dataclasses import asdict
+from itertools import islice
 
 from evalkit import safejson
 from evalkit.errors import EvalKitError
 from evalkit.evaluator import Evaluator
+from evalkit.kit import EvalKit
 from evalkit.limits import MAX_INPUT_FILE_BYTES
 from evalkit.redact import scrub
 
@@ -41,6 +45,25 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("recover", help="save results a failed database write left in <db>.spill/")
 
+    ds = sub.add_parser("dataset", help="versioned, immutable evaluation datasets")
+    dsub = ds.add_subparsers(dest="dataset_command", required=True)
+    imp = dsub.add_parser("import", help="import a JSONL file as a new dataset version")
+    imp.add_argument("name")
+    imp.add_argument("file")
+    imp.add_argument("--description")
+    dsub.add_parser("list", help="list datasets")
+    show = dsub.add_parser("show", help="show a version (name, name@latest, name@3, name@<hash>)")
+    show.add_argument("ref")
+    show.add_argument("--cases", type=int, default=0, metavar="N", help="also print N cases")
+    exp = dsub.add_parser("export", help="write a version as JSONL")
+    exp.add_argument("ref")
+    exp.add_argument("file")
+    exp.add_argument("--force", action="store_true", help="overwrite an existing file")
+    lint = dsub.add_parser("lint", help="report duplicates, empty fields, missing labels")
+    lint.add_argument("ref")
+    ver = dsub.add_parser("verify", help="recompute hashes from stored rows (exit 1 on mismatch)")
+    ver.add_argument("ref")
+
     review = sub.add_parser("review", help="add a human review")
     review.add_argument("id")
     review.add_argument("--reviewer", required=True)
@@ -66,6 +89,46 @@ def _read_input(path: str) -> dict | None:
         print("error: input file must contain a JSON object", file=sys.stderr)
         return None
     return payload
+
+
+def _dataset_command(args: argparse.Namespace) -> tuple[int, object]:
+    """(exit code, JSON-able output) for `evalkit dataset ...`."""
+    kit = EvalKit.from_env()
+    try:
+        ds = kit.datasets
+        match args.dataset_command:
+            case "import":
+                if not os.path.isfile(args.file):
+                    print(f"error: cannot read dataset file: {args.file}", file=sys.stderr)
+                    return 2, None
+                r = ds.import_jsonl(args.name, args.file, description=args.description)
+                return 0, {
+                    "created": r.created,
+                    "version": r.version.model_dump(mode="json") | {"ref": r.version.ref},
+                }
+            case "list":
+                return 0, [d.model_dump(mode="json") for d in ds.list()]
+            case "show":
+                v = ds.resolve(args.ref)
+                out = v.model_dump(mode="json") | {"ref": v.ref}
+                if args.cases > 0:
+                    cases = ds.cases(args.ref, batch_size=min(args.cases, 1000))
+                    out["cases"] = [c.to_record() for c in islice(cases, args.cases)]
+                return 0, out
+            case "export":
+                r = ds.export_jsonl(args.ref, args.file, overwrite=args.force)
+                return 0, {
+                    "path": str(r.path),
+                    "cases": r.case_count,
+                    "content_hash": r.content_hash,
+                }
+            case "lint":
+                return 0, [asdict(f) for f in ds.lint(args.ref)]
+            case _:  # verify
+                report = ds.verify(args.ref)
+                return (0 if report.ok else 1), asdict(report)
+    finally:
+        kit.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -94,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
             output = [r.model_dump(mode="json") for r in results]
             if next_cursor:
                 print(f"next_cursor: {next_cursor}", file=sys.stderr)
+        elif args.command == "dataset":
+            code, output = _dataset_command(args)
+            if output is None:
+                return code
+            print(json.dumps(output, indent=2))
+            return code
         elif args.command == "recover":
             report = Evaluator.from_env(with_judge=False).recover_spilled()
             output = {"recovered": report.recovered, "failed": report.failed}

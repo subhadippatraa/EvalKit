@@ -23,6 +23,7 @@ from evalkit.store import SQLiteStore
 
 RUBRIC = Rubric.from_dict({"a": "A?"})
 LATEST = MIGRATIONS[-1].version
+ALL = [m.version for m in MIGRATIONS]
 
 
 def make_db(path, schema, rows=()):
@@ -110,7 +111,7 @@ def test_reopening_is_idempotent_and_does_not_back_up(tmp_path):
     assert list(tmp_path.glob("*.bak-*")) == []  # nothing to migrate -> nothing to back up
 
 
-# --- legacy databases: the current (v1) and original (v0) schemas -----------------------------
+# --- legacy databases: the current (v1) and original (v0) schemas ----------------------------
 
 
 def test_v1_database_is_upgraded_in_place_and_keeps_its_data(tmp_path):
@@ -141,7 +142,7 @@ def test_v1_database_is_upgraded_in_place_and_keeps_its_data(tmp_path):
     assert old.attempts == []  # predates attempt evidence: unknown, not "no attempts happened"
     assert [r.reviewer for r in old.reviews] == ["alice"]
     assert store.get("old-err").status == "error"
-    assert applied(path) == [1, 2]
+    assert applied(path) == ALL
 
     # the upgraded database accepts new writes, alongside the old rows
     result = Evaluator(FakeJudge(judged(correctness=5, clarity=5)), store).evaluate(
@@ -164,7 +165,7 @@ def test_v0_database_gets_the_context_column_and_can_be_written_again(tmp_path):
         "p", "o", context="new context", criteria=CRITERIA
     )
     assert store.get(result.id).context == "new context"
-    assert applied(path) == [1, 2]
+    assert applied(path) == ALL
 
 
 @pytest.mark.parametrize("schema", [V0_SCHEMA, V1_SCHEMA])
@@ -279,7 +280,7 @@ def test_a_database_with_only_unrelated_tables_is_treated_as_new(tmp_path):
     conn = sqlite3.connect(path)
     assert conn.execute("SELECT x FROM unrelated").fetchall() == [(7,)]
     conn.close()
-    assert applied(path) == [1, 2]
+    assert applied(path) == ALL
 
 
 def test_a_database_newer_than_this_code_is_refused(tmp_path):
@@ -383,7 +384,7 @@ def test_a_failed_legacy_upgrade_leaves_the_original_database_intact(tmp_path, m
     assert conn.execute("SELECT id FROM evaluations").fetchall() == [("old-1",)]
     conn.close()
     SQLiteStore(path).close()  # and the real migrations still complete afterwards
-    assert applied(path) == [1, 2]
+    assert applied(path) == ALL
 
 
 def test_concurrent_openers_of_a_new_database_all_succeed_and_migrate_once(tmp_path):
@@ -426,7 +427,7 @@ def test_concurrent_openers_of_a_legacy_database_migrate_it_once(tmp_path):
     for t in threads:
         t.join()
     assert errors == []
-    assert applied(path) == [1, 2] and "context" in columns(path)
+    assert applied(path) == ALL and "context" in columns(path)
 
 
 # --- named-column writes ---------------------------------------------------------------------
@@ -463,7 +464,7 @@ def test_an_unreadable_stored_rubric_does_not_block_the_upgrade(tmp_path, caplog
     with caplog.at_level(logging.WARNING, logger="evalkit.migrations"):
         SQLiteStore(path).close()
     assert "1 stored rubric(s) unreadable" in caplog.text
-    assert applied(path) == [1, 2]
+    assert applied(path) == ALL
 
 
 def test_the_statement_splitter_keeps_trigger_bodies_whole_and_rejects_truncated_sql():

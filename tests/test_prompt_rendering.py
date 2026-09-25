@@ -130,7 +130,7 @@ def test_angle_bracket_and_its_entity_are_distinguishable():
     assert extract(render(model_output="&lt;"))[1]["model_output"] == "&lt;"
 
 
-# --- structural break-out ----------------------------------------------------------------
+# --- structural break-out --------------------------------------------------------------------
 
 
 def test_forged_delimiters_do_not_end_a_block_early():
@@ -241,7 +241,7 @@ def test_context_is_framed_as_the_source_of_truth():
     assert "source of truth" in text and "do not credit the output" in text
 
 
-# --- both providers send exactly the same request text ----------------------------------------
+# --- both providers send exactly the same request text ---------------------------------------
 
 
 def test_bedrock_and_openai_send_identical_prompts_with_content_intact():
@@ -258,7 +258,7 @@ def test_bedrock_and_openai_send_identical_prompts_with_content_intact():
     assert extract(bedrock_text)[1]["model_output"] == hostile
 
 
-# --- the fingerprint covers rendering behavior, not just constants -----------------------------
+# --- the fingerprint covers rendering behavior, not just constants ---------------------------
 
 
 def test_prompt_version_is_stable_and_well_formed():

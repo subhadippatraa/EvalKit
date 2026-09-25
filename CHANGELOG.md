@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased - P1 dataset foundation
+
+- New: versioned, immutable, content-addressed datasets (`EvalKit.datasets`, `evalkit dataset ...`):
+  atomic strict JSONL import with all-problems reporting, idempotent re-import, `name@version`
+  refs, export round-trip, lint, and `verify`. Migration 3 (`datasets`, `dataset_versions`, `cases`)
+  applies automatically on open; sealed data is immutable via database triggers.
+- New: `evalkit.hashing` (canonical JSON, domain-separated stable hashes), `DatasetError`, and
+  case/import limits (`Limits.max_case_bytes`, `max_import_cases`).
+- The single-record `Evaluator` API, its tables and CLI commands are unchanged.
+
 ## 0.2.0 - P0 hardening of the single-record path
 
 Behavior changes worth knowing about (details: `docs/ARCHITECTURE.md`, "0.2.0 (P0 hardening) changes"):

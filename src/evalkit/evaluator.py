@@ -57,7 +57,7 @@ class Evaluator:
         with_judge=False builds a store-only evaluator (get/list/review) that needs no
         judge/AWS configuration.
         """
-        from evalkit.store import SQLiteStore
+        from evalkit.store import SQLiteStore, default_db_path
 
         judge = None
         if with_judge:
@@ -94,7 +94,7 @@ class Evaluator:
                     f"unsupported EVALKIT_JUDGE_PROVIDER {provider!r}; "
                     "supported: 'bedrock', 'bedrock-openai'"
                 )
-        return cls(judge, SQLiteStore(os.environ.get("EVALKIT_DB_PATH") or "./evalkit.db"))
+        return cls(judge, SQLiteStore(default_db_path()))
 
     def evaluate(
         self,

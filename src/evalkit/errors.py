@@ -1,4 +1,5 @@
 import sqlite3
+from collections.abc import Sequence
 from typing import Any
 
 from evalkit.redact import scrub
@@ -18,6 +19,18 @@ class RubricError(EvalKitError):
 
 class MigrationError(EvalKitError):
     """The database schema is unrecognized, newer than this evalkit, or a migration failed."""
+
+
+class DatasetError(EvalKitError):
+    """A dataset could not be imported, found, read or verified.
+
+    `issues` lists every validation problem found (each with a line/index and case_key where
+    known) so a bad file can be fixed in one pass; nothing is persisted when there are issues.
+    """
+
+    def __init__(self, message: str, issues: Sequence[Any] = ()):
+        super().__init__(scrub(message))
+        self.issues = list(issues)
 
 
 class JudgeError(EvalKitError):

@@ -323,6 +323,25 @@ erDiagram
 
 ### 3.3 Identity and hashing rules
 
+> **Implementation notes (dataset foundation, implemented).** Where the shipped code is more
+> specific than, or differs slightly from, the text below:
+> - `DatasetVersion.content_hash` is `sha256("evalkit-dataset-v1\n" + "<case_key>\t<case_hash>\n"...)`
+>   over cases in ascending `case_key` (byte order), where `case_hash = sha256("evalkit-case-v1\n" +
+>   canonical JSON of the case content)`. It commits to the same information as "canonical JSONL of
+>   sorted cases" but is streamable (SQL supplies the order; no re-serialization). Case hashes
+>   exclude `case_key`, treat `None` and `""` as different, sort `tags`, and keep `retrieved` order.
+>   The domain strings are versioned: a scheme change is a new domain, never an edit.
+> - A version row is inserted `sealed=0`, filled, then sealed with its hash/count **in the same
+>   transaction**; triggers make sealed versions and all cases immutable (UPDATE/DELETE aborted,
+>   INSERT into a sealed version aborted). Committed versions are therefore always sealed.
+> - `cases` has no `ordinal` (order is `case_key`); the case field is named `reference` (not
+>   `reference_output`); unknown fields are refused. Import is atomic: nothing, not even the dataset
+>   row, survives an invalid or empty input; identical content returns the existing version.
+> - Refs: `name`, `name@latest`, `name@<n>`, `name@<8+ hex hash prefix>`.
+> - `evalkit.EvalKit` (`.datasets` only, so far) is the entry point; lint currently reports
+>   `duplicate_content`, `duplicate_prompt`, `empty_output`, `empty_reference`,
+>   `mixed_output_presence`, `retrieved_without_relevance`.
+
 - Canonical JSON: sorted keys, UTF-8, no NaN/Infinity, floats via `repr`.
 - `evaluator_key = f"{kind}:{name}:{h12}"`, `h12 = sha256(canonical(params, rubric, judge model,
   temperature, max_tokens, judge_prompt_fingerprint, scoring_version))[:12]`. Any change that can

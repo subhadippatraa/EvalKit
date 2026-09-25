@@ -17,6 +17,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
+from evalkit.dataset_store import DatasetStoreMixin
 from evalkit.errors import EvalKitError, RubricError
 from evalkit.limits import MAX_LIST_LIMIT
 from evalkit.migrations import migrate
@@ -25,6 +26,7 @@ from evalkit.models import EvaluationResult, Review, format_validation_error
 log = logging.getLogger("evalkit.store")
 
 BUSY_TIMEOUT_S = 10.0
+DEFAULT_DB_PATH = "./evalkit.db"
 # stay under SQLite's bound-variable cap (999 on old builds) when loading reviews for a page
 _IN_CHUNK = 500
 
@@ -44,6 +46,10 @@ class Store(Protocol):
 class Recovery:
     recovered: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)  # spill file name -> reason
+
+
+def default_db_path() -> str:
+    return os.environ.get("EVALKIT_DB_PATH") or DEFAULT_DB_PATH
 
 
 def _enable_wal(conn: sqlite3.Connection) -> None:
@@ -83,7 +89,7 @@ def _decode_cursor(cursor: str) -> tuple[str, int]:
     raise EvalKitError(f"invalid cursor {cursor!r}")
 
 
-class SQLiteStore:
+class SQLiteStore(DatasetStoreMixin):
     """Every call is serialized through one connection and a lock, so a store may be shared
     across threads. Multiple processes may open the same file (WAL + a busy timeout); that is
     tolerated, not tuned for (ponytail: one lock for the whole store, per-thread connections if

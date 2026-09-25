@@ -35,3 +35,15 @@ def store(tmp_path):
     s = SQLiteStore(tmp_path / "evalkit.db")
     yield s
     s.close()
+
+
+@pytest.fixture
+def kit(store):
+    from evalkit import EvalKit
+
+    return EvalKit(store)
+
+
+def case(key="c1", **fields):
+    """A valid dataset case dict; override or add fields."""
+    return {"case_key": key, "prompt": f"prompt for {key}"} | fields

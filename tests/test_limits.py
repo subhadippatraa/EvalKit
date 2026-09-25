@@ -39,7 +39,7 @@ def assert_refused_for_free(store, judge, **kwargs):
     assert judge.calls == [] and len(store.list(limit=100)) == before
 
 
-# --- text fields -------------------------------------------------------------------------------
+# --- text fields -----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("field", ["prompt", "model_output", "reference_output", "context"])
@@ -87,7 +87,7 @@ def test_metadata_and_tag_limits(store):
     assert ok.tags == ["a", "b", "c"]
 
 
-# --- rubric shape --------------------------------------------------------------------------------
+# --- rubric shape ----------------------------------------------------------------------------
 
 
 def test_rubric_shape_limits():
@@ -134,7 +134,7 @@ def test_truncate_utf8_never_splits_a_character_and_never_exceeds_the_budget():
     assert truncate_utf8("short", 100) == ("short", False)
 
 
-# --- CLI input file -----------------------------------------------------------------------------
+# --- CLI input file --------------------------------------------------------------------------
 
 
 @pytest.fixture

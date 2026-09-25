@@ -553,3 +553,33 @@ statement in this document.
   distinct kinds (previously "no tool call"). Error text is scrubbed of ARNs, keys and bearer
   tokens (`evalkit.redact`). The CLI no longer converts an internal `TypeError` into "invalid input
   file", and reports database errors cleanly.
+
+## Dataset foundation (P1, part 1)
+
+The first slice of P1 from [`TARGET-ARCHITECTURE.md`](TARGET-ARCHITECTURE.md) (see its
+implementation notes under §3.3): versioned, immutable datasets. No runs, targets or
+evaluator orchestration yet; the single-record `Evaluator` API is unchanged and shares the database.
+
+| Module | Role |
+|---|---|
+| `hashing.py` | `canonical_json` (sorted, compact, ASCII, no NaN, string keys only), `stable_hash(domain, obj)`, `dataset_hash` |
+| `datasets.py` | pure: `EvaluationCase`, `StoredCase`, `Dataset`, `DatasetVersion`; validation (`validate_cases`, `check_case_limits`), streaming `read_jsonl`, `IssueCollector`, `DatasetService` (import/read/export/lint/verify) |
+| `dataset_store.py` | `DatasetStoreMixin` on `SQLiteStore`: atomic import transaction, resolve, keyset-paged `iter_cases`, `verify_version`, `lint_version` |
+| `kit.py` | `EvalKit.open(path)` / `.from_env()` with `.datasets` |
+| `migrations.py` | migration 3 `dataset_foundation`: `datasets`, `dataset_versions`, `cases`, unique/CHECK constraints, immutability triggers |
+
+- **Import** streams JSONL (UTF-8, no NaN/Infinity/duplicate keys, 4 MiB line cap, oversized lines
+  skipped unread), validates every case strictly (no type coercion, unknown fields refused, size and
+  structure limits, no lone surrogates), and reports **all** problems (capped at 100) with line
+  numbers; nothing is stored unless the whole input is valid. It inserts under `BEGIN IMMEDIATE` into an
+  unsealed version, computes the hash in SQL order, and either returns the existing identical
+  version (rolled back) or seals the new one. The store lock is held for the whole import.
+- **Immutability** is enforced by the database (triggers + CHECKs) and detectable after the fact:
+  `verify` recomputes every case hash and the dataset hash from the stored rows; `export`
+  re-checks each case while writing.
+- **Export** writes JSONL in `case_key` order, atomically, owner-only; re-importing it yields the
+  same content hash (the same version).
+- **Content is lossless**: no escaping or normalization anywhere; `None`, `""` and `[]` stay distinct.
+
+CLI: `evalkit dataset import NAME FILE | list | show REF [--cases N] | export REF FILE [--force] |
+lint REF | verify REF`.

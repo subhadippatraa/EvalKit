@@ -97,6 +97,70 @@ END;
 """
 
 
+# Dataset foundation. A version row is created `sealed=0` while its cases are inserted and sealed
+# (with its hash and count) in the same transaction, so a committed version is always sealed.
+# Triggers make sealed data immutable at the database level, independent of the Python code.
+DATASETS_SQL = """
+CREATE TABLE datasets (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL UNIQUE,
+  description TEXT,
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE dataset_versions (
+  id           TEXT PRIMARY KEY,
+  dataset_id   TEXT NOT NULL REFERENCES datasets(id),
+  version_no   INTEGER NOT NULL CHECK (version_no >= 1),
+  content_hash TEXT,
+  case_count   INTEGER,
+  source       TEXT,
+  created_at   TEXT NOT NULL,
+  sealed       INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1)),
+  UNIQUE (dataset_id, version_no),
+  -- explicit IS NOT NULL: a CHECK that evaluates to NULL (unknown) passes in SQL
+  CHECK (sealed = 0 OR (content_hash IS NOT NULL AND length(content_hash) = 64
+                        AND case_count IS NOT NULL AND case_count >= 1))
+);
+CREATE UNIQUE INDEX ux_dataset_versions_hash
+  ON dataset_versions(dataset_id, content_hash) WHERE content_hash IS NOT NULL;
+
+CREATE TABLE cases (
+  id                 TEXT PRIMARY KEY,
+  dataset_version_id TEXT NOT NULL REFERENCES dataset_versions(id),
+  case_key           TEXT NOT NULL,
+  content_hash       TEXT NOT NULL CHECK (length(content_hash) = 64),
+  prompt             TEXT NOT NULL,
+  output             TEXT,
+  reference          TEXT,
+  context            TEXT,
+  retrieved_json     TEXT,
+  relevance_json     TEXT,
+  metadata_json      TEXT NOT NULL DEFAULT '{}',
+  tags_json          TEXT NOT NULL DEFAULT '[]',
+  UNIQUE (dataset_version_id, case_key)
+);
+
+CREATE TRIGGER cases_no_update BEFORE UPDATE ON cases
+BEGIN SELECT RAISE(ABORT, 'cases are immutable'); END;
+
+CREATE TRIGGER cases_no_delete BEFORE DELETE ON cases
+BEGIN SELECT RAISE(ABORT, 'cases are immutable'); END;
+
+CREATE TRIGGER cases_insert_only_unsealed BEFORE INSERT ON cases
+WHEN (SELECT sealed FROM dataset_versions WHERE id = NEW.dataset_version_id) = 1
+BEGIN SELECT RAISE(ABORT, 'dataset version is sealed'); END;
+
+CREATE TRIGGER dataset_versions_sealed_no_update BEFORE UPDATE ON dataset_versions
+WHEN OLD.sealed = 1
+BEGIN SELECT RAISE(ABORT, 'dataset versions are immutable once sealed'); END;
+
+CREATE TRIGGER dataset_versions_sealed_no_delete BEFORE DELETE ON dataset_versions
+WHEN OLD.sealed = 1
+BEGIN SELECT RAISE(ABORT, 'dataset versions are immutable once sealed'); END;
+"""
+
+
 def _backfill_rubric_versions(conn: sqlite3.Connection) -> None:
     """Register the rubric version -> content hash of every existing row (earliest first wins).
 
@@ -151,6 +215,7 @@ class Migration:
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline", BASELINE_SQL),
     Migration(2, "p0_hardening", P0_SQL, _backfill_rubric_versions),
+    Migration(3, "dataset_foundation", DATASETS_SQL),
 )
 
 _V1_EVALUATION_COLUMNS = frozenset(

@@ -207,6 +207,47 @@ compared directly.
 - **A paid result is not lost when saving fails**: `StoreError.result` plus a spill file; run
   `evalkit recover` (or `evaluator.recover_spilled()`) once the database is healthy.
 
+## Datasets
+
+Versioned, immutable collections of evaluation cases (the foundation for comparing runs; runs and
+targets come next). One JSON object per line:
+
+```json
+{"case_key": "q1", "prompt": "What is 2+2?", "output": "4", "reference": "4", "tags": ["math"]}
+{"case_key": "q2", "prompt": "Capital of France?", "output": "Paris", "retrieved": ["d1", "d2"], "relevance": {"d1": 2, "d2": 0}, "metadata": {"source": "faq"}}
+```
+
+Only `case_key` (stable id, `[A-Za-z0-9._:/-]`, up to 128) and `prompt` are required; `output`,
+`reference`, `context`, `retrieved` (ranked doc ids), `relevance` (doc id to grade), `metadata`,
+`tags` are optional. Unknown fields are refused.
+
+```bash
+evalkit dataset import support-qa cases.jsonl     # creates support-qa@1
+evalkit dataset import support-qa cases.jsonl     # identical content: same version, "created": false
+evalkit dataset list
+evalkit dataset show support-qa@latest --cases 3  # also: support-qa@2, support-qa@<hash prefix>
+evalkit dataset lint support-qa                   # duplicates, empty fields, missing labels
+evalkit dataset verify support-qa                 # recompute hashes from stored rows
+evalkit dataset export support-qa cases-copy.jsonl
+```
+
+```python
+from evalkit import EvalKit
+
+kit = EvalKit.open("evalkit.db")                  # or EvalKit.from_env()
+result = kit.datasets.import_jsonl("support-qa", "cases.jsonl")   # or import_cases([...])
+print(result.version.ref, result.version.content_hash, result.created)
+for case in kit.datasets.cases("support-qa@latest"):
+    ...
+```
+
+- **Import is all-or-nothing** and reports every problem with its line number; a bad file stores
+  nothing (not even the dataset).
+- **A version is immutable and content-addressed.** Changing any case creates the next version;
+  older versions never change. Case order in the file does not matter, nor does the order of `tags`.
+- **Content is stored losslessly** (no escaping or normalization) and hashed canonically; the
+  database itself refuses to update or delete sealed data, and `dataset verify` detects tampering.
+
 ## Human review
 
 Any evaluation, including failed ones, can have any number of reviews. A review has a
