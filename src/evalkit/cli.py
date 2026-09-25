@@ -1,4 +1,8 @@
-"""Thin CLI over Evaluator. Exit codes: 0 ok (incl. FAIL verdict), 1 evaluation error, 2 usage."""
+"""Thin CLI over Evaluator and EvalKit.
+
+Exit codes: 0 ok (incl. a FAIL verdict), 1 error (or a run that did not complete), 2 usage,
+3 gate failed, 4 gate inconclusive under --strict.
+"""
 
 import argparse
 import inspect
@@ -9,13 +13,14 @@ import sys
 from dataclasses import asdict
 from itertools import islice
 
-from evalkit import safejson
+from evalkit import cli_platform, safejson
 from evalkit.errors import EvalKitError
 from evalkit.evaluator import Evaluator
 from evalkit.failures import FailureClass
 from evalkit.kit import EvalKit
 from evalkit.limits import MAX_INPUT_FILE_BYTES
 from evalkit.redact import scrub
+from evalkit.report import DEFAULT_MAX_CASES
 from evalkit.runs import TRANSITIONS
 
 # keys evaluate() accepts, for a clear "unknown key" message before calling it
@@ -66,25 +71,88 @@ def _parser() -> argparse.ArgumentParser:
     ver = dsub.add_parser("verify", help="recompute hashes from stored rows (exit 1 on mismatch)")
     ver.add_argument("ref")
 
-    runs = sub.add_parser("runs", help="runs and their recorded results")
+    runs = sub.add_parser("runs", help="create, execute and inspect runs")
     rsub = runs.add_subparsers(dest="runs_command", required=True)
-    create = rsub.add_parser("create", help="freeze a run config against a dataset version")
+    create = rsub.add_parser("create", help="preflight, freeze and plan a run from a spec file")
     create.add_argument("dataset", help="dataset ref: name, name@latest, name@3, name@<hash>")
-    create.add_argument("--config", required=True, help="JSON file: a RunConfig")
+    create.add_argument("--config", required=True, help="spec file (.json or .toml)")
     create.add_argument("--name")
     create.add_argument("--idempotency-key")
+    create.add_argument("--target", metavar="PKG.MOD:FN", help="a callable target (trusted code)")
+    create.add_argument("--fingerprint", help="declared identity of the callable (e.g. a git sha)")
+    for name, help_text in (
+        ("execute", "execute a created run"),
+        ("resume", "resume a stopped run"),
+    ):
+        ex = rsub.add_parser(name, help=help_text)
+        ex.add_argument("id")
+        ex.add_argument("--target", metavar="PKG.MOD:FN", help="the run's callable target")
+        ex.add_argument("--fingerprint")
     rls = rsub.add_parser("list", help="list runs, newest first")
     rls.add_argument("--dataset", help="only runs of this dataset version")
     rls.add_argument("--status", choices=sorted(TRANSITIONS))
     rls.add_argument("--limit", type=_positive_int, default=20)
     rshow = rsub.add_parser("show", help="show a run with its progress")
     rshow.add_argument("id")
+    rshow.add_argument("--summary", action="store_true", help="include the aggregated summary")
     rfail = rsub.add_parser("failures", help="list failures, optionally of one class")
     rfail.add_argument("id")
     rfail.add_argument("--class", dest="failure_class", choices=[c.value for c in FailureClass])
     rfail.add_argument("--limit", type=_positive_int, default=100)
     rver = rsub.add_parser("verify", help="recheck a run (exit 1 on mismatch)")
     rver.add_argument("id")
+    rtag = rsub.add_parser("tag", help="tag a run (a baseline is `tag:main`)")
+    rtag.add_argument("id")
+    rtag.add_argument("tag")
+    rtag.add_argument("--remove", action="store_true")
+    rrev = rsub.add_parser("review", help="add a human review of one case's evaluator verdict")
+    rrev.add_argument("id")
+    rrev.add_argument("case_key")
+    rrev.add_argument("--evaluator", required=True, help="the evaluator key being graded")
+    rrev.add_argument("--reviewer", required=True)
+    rrev.add_argument("--verdict", required=True, type=str.upper, choices=["PASS", "FAIL"])
+    rrev.add_argument("--sample", choices=["random", "targeted"], default="targeted")
+    rrev.add_argument("--score", type=float)
+    rrev.add_argument("--comment")
+    rcal = rsub.add_parser("calibrate", help="judge-vs-human agreement for one evaluator")
+    rcal.add_argument("id")
+    rcal.add_argument("--evaluator", required=True)
+    rcal.add_argument("--n-min", type=_positive_int, default=30)
+    rq = rsub.add_parser("queue", help="cases to review next")
+    rq.add_argument("id")
+    rq.add_argument("--evaluator", required=True)
+    rq.add_argument(
+        "--strategy",
+        choices=["random", "stratified", "uncertain", "disagreement"],
+        default="random",
+    )
+    rq.add_argument("-n", type=_positive_int, default=30)
+    rq.add_argument("--seed", type=int, default=0)
+    rdis = rsub.add_parser("disagreements", help="cases where evaluators disagree")
+    rdis.add_argument("id")
+    rdis.add_argument("--tau", type=float, default=0.25)
+
+    cmp_ = sub.add_parser(
+        "compare", help="paired comparison with a baseline; gates set the exit code"
+    )
+    cmp_.add_argument("candidate")
+    cmp_.add_argument("--baseline", required=True, help="a run id, or tag:NAME")
+    cmp_.add_argument("--gates", help="gates file (.toml or .json)")
+    cmp_.add_argument("--allow-confounders", action="store_true")
+    cmp_.add_argument("--strict", action="store_true", help="an inconclusive gate exits 4")
+    cmp_.add_argument("--seed", type=int, default=0)
+    rep = sub.add_parser("report", help="write a self-contained static HTML report")
+    rep.add_argument("id")
+    rep.add_argument("--out", required=True)
+    rep.add_argument("--compare", metavar="BASELINE", help="a run id, or tag:NAME")
+    rep.add_argument("--gates")
+    rep.add_argument("--allow-confounders", action="store_true")
+    rep.add_argument("--max-cases", type=int, default=DEFAULT_MAX_CASES)
+    rep.add_argument("--force", action="store_true", help="overwrite an existing file")
+    jc = sub.add_parser("judge-check", help="run the golden set through the configured judge")
+    jc.add_argument("--cases", help="JSONL of known-verdict cases (default: the built-in set)")
+    jc.add_argument("--rubric", help="rubric JSON for --cases (default: the built-in rubric)")
+    jc.add_argument("--min-accuracy", type=float, help="exit 3 if accuracy is lower")
 
     review = sub.add_parser("review", help="add a human review")
     review.add_argument("id")
@@ -153,42 +221,12 @@ def _dataset_command(args: argparse.Namespace) -> tuple[int, object]:
         kit.close()
 
 
-def _runs_command(args: argparse.Namespace) -> tuple[int, object]:
-    """(exit code, JSON-able output) for `evalkit runs ...`."""
-    kit = EvalKit.from_env()
-    try:
-        rs = kit.runs
-        match args.runs_command:
-            case "create":
-                config = _read_input(args.config)
-                if config is None:
-                    return 2, None
-                run = rs.create(
-                    args.dataset,
-                    config,
-                    name=args.name,
-                    idempotency_key=args.idempotency_key,
-                )
-                return 0, run.model_dump(mode="json")
-            case "list":
-                runs = rs.list(dataset_ref=args.dataset, status=args.status, limit=args.limit)
-                return 0, [r.model_dump(mode="json") for r in runs]
-            case "show":
-                return 0, {
-                    "run": rs.get(args.id).model_dump(mode="json"),
-                    "counts": asdict(rs.counts(args.id)),
-                    "failure_counts": [asdict(c) for c in rs.failure_counts(args.id)],
-                }
-            case "failures":
-                found = rs.failures(args.id, failure_class=args.failure_class, limit=args.limit)
-                return 0, [
-                    {**asdict(f), "failure": f.failure.model_dump(mode="json")} for f in found
-                ]
-            case _:  # verify
-                report = rs.verify(args.id)
-                return (0 if report.ok else 1), asdict(report)
-    finally:
-        kit.close()
+_PLATFORM = {
+    "runs": cli_platform.runs_command,
+    "compare": cli_platform.compare_command,
+    "report": cli_platform.report_command,
+    "judge-check": cli_platform.judge_check_command,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -223,8 +261,8 @@ def main(argv: list[str] | None = None) -> int:
                 return code
             print(json.dumps(output, indent=2))
             return code
-        elif args.command == "runs":
-            code, output = _runs_command(args)
+        elif args.command in _PLATFORM:
+            code, output = _PLATFORM[args.command](args)
             if output is None:
                 return code
             print(json.dumps(output, indent=2))
@@ -240,6 +278,9 @@ def main(argv: list[str] | None = None) -> int:
                 .review(args.id, args.reviewer, args.verdict, args.score, args.comment)
                 .model_dump(mode="json")
             )
+    except cli_platform.UsageError as e:
+        print(f"error: {scrub(str(e))}", file=sys.stderr)
+        return 2
     except EvalKitError as e:
         print(f"error: {scrub(str(e))}", file=sys.stderr)
         if evaluation_id := getattr(e, "evaluation_id", None):
@@ -250,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
     except sqlite3.Error as e:
         print(f"error: database error: {scrub(str(e))}", file=sys.stderr)
         return 1
+    except OSError as e:  # an unreadable file argument is a usage problem
+        print(f"error: cannot read or write a file: {scrub(str(e))}", file=sys.stderr)
+        return 2
 
     print(json.dumps(output, indent=2))
     return 0
