@@ -707,7 +707,10 @@ class RunController:
         else:
             status, reason = halted or ("partial", "incomplete")
             final = self.runs.transition(run_id, status, stop_reason=reason)
-        self.kit.snapshot(final.id)
+        try:
+            self.kit.snapshot(final.id)
+        except Exception:  # noqa: BLE001 - a summary problem must not lose the execution report
+            log.exception("could not store the run summary snapshot (recompute with summarize())")
         return ExecutionReport(
             run=final,
             counts=self.runs.counts(run_id),

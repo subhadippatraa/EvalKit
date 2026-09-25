@@ -17,6 +17,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
+from evalkit.analysis_store import AnalysisStoreMixin
 from evalkit.dataset_store import DatasetStoreMixin
 from evalkit.errors import EvalKitError, RubricError
 from evalkit.limits import MAX_LIST_LIMIT
@@ -97,7 +98,7 @@ def _decode_cursor(cursor: str) -> tuple[str, int]:
     raise EvalKitError(f"invalid cursor {cursor!r}")
 
 
-class SQLiteStore(DatasetStoreMixin, RunStoreMixin):
+class SQLiteStore(DatasetStoreMixin, RunStoreMixin, AnalysisStoreMixin):
     """Every call is serialized through one connection and a lock, so a store may be shared
     across threads. Multiple processes may open the same file (WAL + a busy timeout); that is
     tolerated, not tuned for (ponytail: one lock for the whole store, per-thread connections if

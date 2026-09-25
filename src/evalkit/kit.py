@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from evalkit.calibration import ReviewService
 from evalkit.datasets import DatasetService
 from evalkit.engine import RunController
 from evalkit.limits import Limits
@@ -27,6 +28,7 @@ class EvalKit:
         self.datasets = DatasetService(store, self.limits)
         self.runs = RunService(store, self.datasets, self.limits)
         self.controller = RunController(self)
+        self.reviews = ReviewService(self)
 
     @classmethod
     def open(cls, path: str | Path, limits: Limits | None = None) -> EvalKit:
@@ -38,8 +40,17 @@ class EvalKit:
         """The database named by EVALKIT_DB_PATH (default ./evalkit.db)."""
         return cls.open(default_db_path(), limits)
 
-    def snapshot(self, run_id: str) -> None:
-        """Store a summary snapshot of the run (placeholder until analysis is wired)."""
+    def snapshot(self, run_id: str) -> str:
+        """Store an immutable summary snapshot of the run (recomputable from its rows)."""
+        from evalkit.analysis import take_snapshot
+
+        return take_snapshot(self, run_id)
+
+    def summarize(self, run_id: str, **kwargs):
+        """Aggregate a run now (see `evalkit.analysis.summarize`)."""
+        from evalkit.analysis import summarize
+
+        return summarize(self, run_id, **kwargs)
 
     def close(self) -> None:
         self.store.close()
