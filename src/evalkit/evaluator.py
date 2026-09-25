@@ -1,21 +1,54 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import os
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from evalkit.errors import ConfigError, EvalKitError, JudgeError, JudgeOutputError, RubricError
+from evalkit.errors import (
+    ConfigError,
+    EvalKitError,
+    JudgeError,
+    JudgeOutputError,
+    JudgeTimeoutError,
+    RubricError,
+    ScoringError,
+    StoreError,
+)
 from evalkit.judge import Judge
-from evalkit.models import EvaluationResult, Review, Rubric, format_validation_error
+from evalkit.limits import (
+    MAX_ERROR_CHARS,
+    MAX_EVIDENCE_BYTES,
+    MAX_TAG_CHARS,
+    Limits,
+    truncate_utf8,
+)
+from evalkit.models import (
+    Attempt,
+    AttemptOutcome,
+    EvaluationResult,
+    Review,
+    Rubric,
+    format_validation_error,
+)
 from evalkit.store import Store
+
+UNEXPECTED = "unexpected_error"  # JudgeError.kind for a non-evalkit exception raised by a judge
 
 
 class Evaluator:
-    def __init__(self, judge: Judge | None, store: Store | None = None):
+    def __init__(
+        self, judge: Judge | None, store: Store | None = None, limits: Limits | None = None
+    ):
         self.judge = judge
         self.store = store
+        self.limits = limits or Limits()
 
     @classmethod
     def from_env(cls, *, with_judge: bool = True) -> Evaluator:
@@ -32,8 +65,8 @@ class Evaluator:
             model = os.environ.get("EVALKIT_JUDGE_MODEL")
             if not model:
                 raise ConfigError("EVALKIT_JUDGE_MODEL is required")
-            temperature = _float_env("EVALKIT_JUDGE_TEMPERATURE", 0.0)
-            timeout = _float_env("EVALKIT_JUDGE_TIMEOUT", 60.0)
+            temperature = _float_env("EVALKIT_JUDGE_TEMPERATURE", 0.0, minimum=0.0)
+            timeout = _float_env("EVALKIT_JUDGE_TIMEOUT", 60.0, positive=True)
 
             if provider == "bedrock":
                 from evalkit.bedrock import BedrockJudge  # keep boto3 out of the core import path
@@ -78,7 +111,7 @@ class Evaluator:
             raise ConfigError("no judge configured")
         judge = self.judge
 
-        # 1. validate inputs before the judge; invalid input is never persisted
+        # 1. validate inputs before the judge; invalid input is never persisted and never paid for
         try:
             if (criteria is None) == (rubric is None):
                 raise RubricError("pass exactly one of `criteria` or `rubric`")
@@ -88,8 +121,8 @@ class Evaluator:
                 rubric = Rubric.from_dict(criteria)
             elif not isinstance(rubric, Rubric):
                 rubric = Rubric.model_validate(rubric)
-            result = EvaluationResult(
-                status="ok",
+            self._check_sizes(prompt, model_output, reference_output, context, tags)
+            common: dict[str, Any] = dict(
                 prompt=prompt,
                 model_output=model_output,
                 reference_output=reference_output,
@@ -103,45 +136,147 @@ class Evaluator:
                 metadata=metadata or {},
                 tags=tags or [],
             )
+            # a draft is an (unjudged) error result: it validates the inputs, then supplies the
+            # id and start time of the real result built after judging
+            draft = EvaluationResult(status="error", error="not yet judged", **common)
+            self._check_metadata_size(draft.metadata)
         except ValidationError as e:
             raise RubricError(f"invalid input: {format_validation_error(e)}") from e
+        assert rubric.version is not None
+        # bind the rubric version to its content BEFORE paying for a judge call
+        register = getattr(self.store, "register_rubric", None)
+        if register is not None:
+            register(rubric.version, rubric.content_hash)
 
-        # 2. judge + score; retry once only on malformed output
+        # 2. judge + score; retry once only on malformed output. Every attempt is recorded.
+        attempts: list[Attempt] = []
+        scored = None
         error: JudgeError | None = None
         start = time.perf_counter()
-        for _ in range(2):
+        for n in (1, 2):
+            started_at, t0, raw, exc = datetime.now(UTC), time.perf_counter(), None, None
             try:
                 raw = judge.judge(prompt, model_output, reference_output, context, rubric)
-                result.scores, result.overall_score, result.verdict = rubric.score(raw)
-                error = None
-                break
-            except JudgeOutputError as e:
-                error = e
+                scored = rubric.score(raw)
             except JudgeError as e:
-                error = e
-                break
+                exc = e
             except Exception as e:  # a buggy custom judge must still produce an error row
-                error = JudgeError(f"judge raised {type(e).__name__}: {e}")
-                error.__cause__ = e
-                break
-        result.latency_ms = round((time.perf_counter() - start) * 1000)
+                exc = JudgeError(f"judge raised {type(e).__name__}: {e}", kind=UNEXPECTED)
+                exc.__cause__ = e
+            attempts.append(_attempt(n, started_at, time.perf_counter() - t0, exc, raw))
+            error = exc
+            if not isinstance(exc, JudgeOutputError):
+                break  # success, or a failure that is never retried
+        latency_ms = round((time.perf_counter() - start) * 1000)
 
-        if error is not None:
-            result.status = "error"
-            result.error = f"{type(error).__name__}: {error}"
+        result = None
+        if error is None:
+            assert scored is not None
+            scores, overall, verdict = scored
+            try:
+                result = EvaluationResult(
+                    id=draft.id,
+                    created_at=draft.created_at,
+                    status="ok",
+                    scores=scores,
+                    overall_score=overall,
+                    verdict=verdict,
+                    latency_ms=latency_ms,
+                    attempts=attempts,
+                    **common,
+                )
+            except ValidationError as e:  # a scoring bug must not lose the (paid) attempt evidence
+                error = ScoringError(f"inconsistent result: {format_validation_error(e)}")
+        if result is None:
+            assert error is not None
+            result = EvaluationResult(
+                id=draft.id,
+                created_at=draft.created_at,
+                status="error",
+                error=_clip(f"{type(error).__name__}: {error}", MAX_ERROR_CHARS),
+                latency_ms=latency_ms,
+                attempts=attempts,
+                **common,
+            )
 
-        # 3. persist ok and judge-stage error rows alike
+        # 3. persist ok and judge-stage error rows alike; a judged result is never silently lost
         if self.store is not None:
             try:
                 self.store.save(result)
             except Exception as store_exc:
-                # sqlite3.Error still propagates as the raised exception, per architecture;
-                # chain to the judge failure that triggered it (if any) so it isn't lost
-                raise store_exc from error
+                raise self._store_error(result, store_exc, error) from store_exc
         if error is not None:
             error.evaluation_id = result.id if self.store is not None else None
             raise error
         return result
+
+    def _store_error(
+        self, result: EvaluationResult, cause: Exception, judge_error: JudgeError | None
+    ) -> StoreError:
+        spill = getattr(self.store, "spill_result", None)
+        path: Path | None = None
+        spill_note = "; the result is available as StoreError.result"
+        if spill is not None:
+            try:
+                path = spill(result)
+                spill_note = f"; the result was written to {path} (recover with recover_spilled())"
+            except Exception as spill_exc:
+                spill_note = (
+                    f"; writing the recovery file also failed ({type(spill_exc).__name__}: "
+                    f"{spill_exc}); the result is available as StoreError.result"
+                )
+        outcome = "judged ok" if result.status == "ok" else f"judge failed ({result.error})"
+        err = StoreError(
+            f"evaluation {result.id} ({outcome}) could not be saved: "
+            f"{type(cause).__name__}: {cause}{spill_note}",
+            result=result,
+            spill_path=path,
+        )
+        err.judge_error = judge_error  # the judge failure, if that is what was being saved
+        return err
+
+    def _check_sizes(
+        self,
+        prompt: Any,
+        model_output: Any,
+        reference_output: Any,
+        context: Any,
+        tags: Any,
+    ) -> None:
+        fields = {
+            "prompt": prompt,
+            "model_output": model_output,
+            "reference_output": reference_output,
+            "context": context,
+        }
+        for name, value in fields.items():
+            if not isinstance(value, str):
+                continue  # wrong types are reported by model validation
+            try:
+                size = len(value) if len(value) > self.limits.max_field_bytes else None
+                if size is None:
+                    size = len(value.encode("utf-8"))
+            except UnicodeEncodeError as e:
+                raise RubricError(
+                    f"`{name}` is not valid Unicode text (unpaired surrogate): {e.reason}"
+                ) from e
+            if size > self.limits.max_field_bytes:
+                raise RubricError(
+                    f"`{name}` is too large ({size} bytes; limit {self.limits.max_field_bytes})"
+                )
+        if isinstance(tags, list):
+            if len(tags) > self.limits.max_tags:
+                raise RubricError(f"too many tags ({len(tags)}; limit {self.limits.max_tags})")
+            if any(isinstance(t, str) and len(t) > MAX_TAG_CHARS for t in tags):
+                raise RubricError(f"a tag is longer than {MAX_TAG_CHARS} characters")
+
+    def _check_metadata_size(self, metadata: dict[str, Any]) -> None:
+        size = len(json.dumps(metadata, allow_nan=False).encode("utf-8", "replace"))
+        if size > self.limits.max_metadata_bytes:
+            raise RubricError(
+                f"`metadata` is too large ({size} bytes as JSON; "
+                f"limit {self.limits.max_metadata_bytes})"
+            )
 
     def review(
         self,
@@ -176,17 +311,90 @@ class Evaluator:
     def list(self, tag: str | None = None, limit: int = 20) -> list[EvaluationResult]:
         return self._require_store().list(tag=tag, limit=limit)
 
+    def list_page(
+        self, tag: str | None = None, limit: int = 20, cursor: str | None = None
+    ) -> tuple[list[EvaluationResult], str | None]:
+        """Like list(), plus a `next_cursor` to continue from (None on the last page)."""
+        store = self._require_store()
+        page = getattr(store, "list_page", None)
+        if page is None:
+            raise ConfigError("this store does not support pagination cursors")
+        return page(tag=tag, limit=limit, cursor=cursor)
+
+    def recover_spilled(self):
+        """Save results that a failed store.save() left in the spill directory."""
+        recover = getattr(self._require_store(), "recover_spilled", None)
+        if recover is None:
+            raise ConfigError("this store does not support spill recovery")
+        return recover()
+
     def _require_store(self) -> Store:
         if self.store is None:
             raise ConfigError("no store configured")
         return self.store
 
 
-def _float_env(name: str, default: float) -> float:
+def _float_env(
+    name: str, default: float, *, minimum: float | None = None, positive: bool = False
+) -> float:
     value = os.environ.get(name)
     if not value:
         return default
     try:
-        return float(value)
+        number = float(value)
     except ValueError as e:
         raise ConfigError(f"{name} must be a number, got {value!r}") from e
+    if not math.isfinite(number):
+        raise ConfigError(f"{name} must be a finite number, got {value!r}")
+    if positive and number <= 0:
+        raise ConfigError(f"{name} must be > 0, got {value!r}")
+    if minimum is not None and number < minimum:
+        raise ConfigError(f"{name} must be >= {minimum}, got {value!r}")
+    return number
+
+
+def _clip(text: str, max_chars: int) -> str:
+    # text may hold unpaired surrogates from a provider; make it encodable before it is stored
+    text = text.encode("utf-8", "replace").decode("utf-8")
+    return text if len(text) <= max_chars else text[: max_chars - 1] + "\u2026"
+
+
+def _outcome(exc: JudgeError) -> AttemptOutcome:
+    if isinstance(exc, JudgeOutputError):
+        return "invalid_output"
+    if isinstance(exc, JudgeTimeoutError):
+        return "timeout"
+    if isinstance(exc, ScoringError):
+        return "scoring_error"
+    return "unexpected_error" if exc.kind == UNEXPECTED else "provider_error"
+
+
+def _attempt(
+    n: int, started_at: datetime, seconds: float, exc: JudgeError | None, raw: Any
+) -> Attempt:
+    """Evidence for one judge call. The rejected/partial output is kept (truncated) only for
+    failed attempts; a successful attempt keeps just a hash, its content is the stored scores."""
+    evidence = raw if raw is not None else getattr(exc, "raw", None)
+    text = sha = None
+    truncated = False
+    if evidence is not None:
+        try:
+            full = json.dumps(evidence, ensure_ascii=False, default=repr)
+        except (TypeError, ValueError):  # e.g. circular structure
+            full = repr(evidence)
+        full = full.encode("utf-8", "replace").decode("utf-8")
+        sha = hashlib.sha256(full.encode()).hexdigest()
+        if exc is not None:
+            text, truncated = truncate_utf8(full, MAX_EVIDENCE_BYTES)
+    return Attempt(
+        n=n,
+        outcome="ok" if exc is None else _outcome(exc),
+        started_at=started_at,
+        duration_ms=round(seconds * 1000),
+        error_type=None if exc is None else type(exc).__name__,
+        error=None if exc is None else _clip(str(exc), MAX_ERROR_CHARS),
+        kind=getattr(exc, "kind", None),
+        raw=text,
+        raw_sha256=sha,
+        raw_truncated=truncated,
+    )

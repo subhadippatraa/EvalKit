@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import re
 import uuid
 from datetime import UTC, datetime
@@ -7,9 +8,36 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from evalkit.errors import JudgeOutputError
+from evalkit.errors import JudgeOutputError, ScoringError
+from evalkit.limits import (
+    MAX_CRITERIA,
+    MAX_DESCRIPTION_CHARS,
+    MAX_LABEL_CHARS,
+    MAX_LABELS,
+    MAX_REVIEW_COMMENT_CHARS,
+    MAX_REVIEWER_CHARS,
+    MAX_SCALE_ABS,
+    MAX_VERSION_CHARS,
+    MAX_WEIGHT,
+    MIN_WEIGHT,
+)
 
 Verdict = Literal["PASS", "FAIL"]
+
+# The judge prompt (evalkit.judge) delimits untrusted content with these markers. Trusted rubric
+# text must not contain them, so it can never be mistaken for (or forge) a delimiter line.
+DELIMITER_OPEN = "<<<EVALKIT:"
+DELIMITER_CLOSE = "<<<END:"
+
+
+def _no_delimiters(text: str, what: str) -> str:
+    try:
+        text.encode("utf-8")  # unpaired surrogates would fail later, at persist/send time
+    except UnicodeEncodeError as e:
+        raise ValueError(f"{what} is not valid Unicode text (unpaired surrogate)") from e
+    if DELIMITER_OPEN in text or DELIMITER_CLOSE in text:
+        raise ValueError(f"{what} must not contain {DELIMITER_OPEN!r} or {DELIMITER_CLOSE!r}")
+    return text
 
 
 def _new_id() -> str:
@@ -33,14 +61,20 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 class Criterion(BaseModel):
     name: str = Field(min_length=1, pattern=_NAME_RE.pattern)
-    description: str = Field(min_length=1)
+    description: str = Field(min_length=1, max_length=MAX_DESCRIPTION_CHARS)
     # Exactly one of scale/labels ends up set (see _check_scale_or_labels). Both default to
     # None so the validator can tell "neither given" (-> default numeric scale, the pre-labels
     # behavior) apart from "both given" (-> error), which isn't possible if `scale` keeps a
     # non-None default.
     scale: tuple[int, int] | None = None
     labels: tuple[str, ...] | None = None
-    weight: float = Field(default=1.0, gt=0)
+    # bounded + finite: keeps Rubric.score's weighted mean exactly representable (no inf/inf)
+    weight: float = Field(default=1.0, ge=MIN_WEIGHT, le=MAX_WEIGHT, allow_inf_nan=False)
+
+    @field_validator("description")
+    @classmethod
+    def _description_safe(cls, v: str) -> str:
+        return _no_delimiters(v, "criterion description")
 
     @model_validator(mode="after")
     def _check_scale_or_labels(self) -> "Criterion":
@@ -48,13 +82,27 @@ class Criterion(BaseModel):
             raise ValueError("a criterion cannot set both `scale` and `labels`")
         if self.scale is None and self.labels is None:
             self.scale = (1, 5)  # unchanged default from before `labels` existed
-        if self.scale is not None and self.scale[0] >= self.scale[1]:
-            raise ValueError(f"scale min must be < max, got {self.scale}")
+        if self.scale is not None:
+            if self.scale[0] >= self.scale[1]:
+                raise ValueError(f"scale min must be < max, got {self.scale}")
+            if max(abs(self.scale[0]), abs(self.scale[1])) > MAX_SCALE_ABS:
+                raise ValueError(
+                    f"scale bounds must be within +/-{MAX_SCALE_ABS}, got {self.scale}"
+                )
         if self.labels is not None:
             if len(self.labels) < 2:
                 raise ValueError(f"labels must have at least 2 entries, got {self.labels}")
+            if len(self.labels) > MAX_LABELS:
+                raise ValueError(f"at most {MAX_LABELS} labels allowed, got {len(self.labels)}")
             if len(set(self.labels)) != len(self.labels):
                 raise ValueError(f"labels must be unique, got {self.labels}")
+            for label in self.labels:
+                # labels are rendered into the trusted criteria section: keep them one boring line
+                if not label or len(label) > MAX_LABEL_CHARS or not label.isprintable():
+                    raise ValueError(
+                        f"labels must be 1-{MAX_LABEL_CHARS} printable characters, got {label!r}"
+                    )
+                _no_delimiters(label, "label")
         return self
 
 
@@ -76,9 +124,18 @@ class CriterionScore(BaseModel):
 
 
 class Rubric(BaseModel):
-    criteria: list[Criterion] = Field(min_length=1)
-    threshold: float = Field(default=0.75, ge=0, le=1)
-    version: str | None = None
+    criteria: list[Criterion] = Field(min_length=1, max_length=MAX_CRITERIA)
+    threshold: float = Field(default=0.75, ge=0, le=1, allow_inf_nan=False)
+    version: str | None = Field(default=None, min_length=1, max_length=MAX_VERSION_CHARS)
+
+    @field_validator("version")
+    @classmethod
+    def _version_is_one_printable_line(cls, v: str | None) -> str | None:
+        if v is not None:
+            if not v.isprintable():
+                raise ValueError("version must be printable, single-line text")
+            _no_delimiters(v, "version")
+        return v
 
     @model_validator(mode="after")
     def _check_and_version(self) -> "Rubric":
@@ -87,9 +144,18 @@ class Rubric(BaseModel):
         if dupes:
             raise ValueError(f"duplicate criterion names: {dupes}")
         if self.version is None:
-            canonical = json.dumps(self.model_dump(exclude={"version"}), sort_keys=True)
-            self.version = hashlib.sha256(canonical.encode()).hexdigest()[:12]
+            self.version = self.content_hash[:12]
         return self
+
+    @property
+    def content_hash(self) -> str:
+        """sha256 of the rubric's canonical content (everything except `version`).
+
+        The store records it per `version` so one version label can never silently refer to
+        two different rubrics. The auto version is its first 12 hex characters.
+        """
+        canonical = json.dumps(self.model_dump(exclude={"version"}), sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
     @classmethod
     def from_dict(cls, criteria: dict[str, str]) -> "Rubric":
@@ -109,7 +175,7 @@ class Rubric(BaseModel):
             )
 
         scores: dict[str, CriterionScore] = {}
-        weighted_sum = 0.0
+        contributions: list[float] = []
         for c in self.criteria:
             try:
                 # strict: no coercion of "4", 4.0 or True into an int score
@@ -139,21 +205,48 @@ class Rubric(BaseModel):
                     )
                 normalized = (cs.score - lo) / (hi - lo)
             scores[c.name] = cs
-            weighted_sum += c.weight * normalized
+            contributions.append(c.weight * normalized)
 
-        # rounding keeps exact thresholds (e.g. all 4s on 1-5 == 0.75) free of float noise
-        overall = round(weighted_sum / sum(c.weight for c in self.criteria), 10)
+        # fsum: correctly-rounded sums, so the mean does not depend on criterion order.
+        # Rounding keeps exact thresholds (e.g. all 4s on 1-5 == 0.75) free of float noise.
+        overall = round(math.fsum(contributions) / math.fsum(c.weight for c in self.criteria), 10)
+        # unreachable with bounded finite weights and validated scores; kept so a future change
+        # can never turn NaN/inf/out-of-range into an "ok" result (audit F-1)
+        if not math.isfinite(overall) or not 0.0 <= overall <= 1.0:
+            raise ScoringError(f"computed overall score is not a finite value in [0, 1]: {overall}")
         return scores, overall, "PASS" if overall >= self.threshold else "FAIL"
 
 
 class Review(BaseModel):
     id: str = Field(default_factory=_new_id)
     evaluation_id: str = Field(min_length=1)
-    reviewer: str = Field(min_length=1)
+    reviewer: str = Field(min_length=1, max_length=MAX_REVIEWER_CHARS)
     verdict: Verdict
-    score: float | None = Field(default=None, ge=0, le=1)
-    comment: str | None = None
+    score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    comment: str | None = Field(default=None, max_length=MAX_REVIEW_COMMENT_CHARS)
     created_at: datetime = Field(default_factory=_now)
+
+
+AttemptOutcome = Literal[
+    "ok", "invalid_output", "timeout", "provider_error", "scoring_error", "unexpected_error"
+]
+
+
+class Attempt(BaseModel):
+    """One judge call and what came of it. Every call is recorded, so a result that succeeded
+    on its retry is distinguishable from one that succeeded first time, and a rejected output
+    is kept for debugging (failed attempts only; truncated -- see evalkit.limits)."""
+
+    n: int = Field(ge=1)
+    outcome: AttemptOutcome
+    started_at: datetime
+    duration_ms: int = Field(ge=0)
+    error_type: str | None = None  # exception class name
+    error: str | None = None  # scrubbed and truncated
+    kind: str | None = None  # provider-detected sub-case, see JudgeError
+    raw: str | None = None  # rejected/partial judge output as text (failed attempts only)
+    raw_sha256: str | None = None  # of the full, untruncated text
+    raw_truncated: bool = False
 
 
 class EvaluationResult(BaseModel):
@@ -169,12 +262,14 @@ class EvaluationResult(BaseModel):
     rubric_version: str
     judge_provider: str
     judge_model: str
-    judge_temperature: float
+    judge_temperature: float = Field(ge=0, allow_inf_nan=False)
     judge_prompt_version: str
     scores: dict[str, CriterionScore] = Field(default_factory=dict)
-    overall_score: float | None = None
+    overall_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     verdict: Verdict | None = None
-    latency_ms: int | None = None
+    latency_ms: int | None = Field(default=None, ge=0)
+    # empty for rows written before attempt evidence existed
+    attempts: list[Attempt] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
     reviews: list[Review] = Field(default_factory=list)
@@ -183,10 +278,36 @@ class EvaluationResult(BaseModel):
     @classmethod
     def _json_serializable(cls, v: dict[str, Any]) -> dict[str, Any]:
         try:
-            json.dumps(v)
+            json.dumps(v, allow_nan=False)
         except (TypeError, ValueError) as e:
-            raise ValueError(f"metadata must be JSON-serializable: {e}") from e
+            raise ValueError(f"metadata must be JSON-serializable (no NaN/Infinity): {e}") from e
         return v
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "EvaluationResult":
+        """An "ok" result carries a score and a verdict that follow from its rubric; an "error"
+        result carries neither. Nothing else can be persisted or returned (audit F-1)."""
+        if self.rubric_version != self.rubric.version:
+            raise ValueError("rubric_version does not match rubric.version")
+        if self.status == "error":
+            if self.error is None:
+                raise ValueError("an error result needs an error message")
+            if self.scores or self.overall_score is not None or self.verdict is not None:
+                raise ValueError("an error result must not carry scores, overall_score or verdict")
+            return self
+        if self.error is not None:
+            raise ValueError("an ok result must not carry an error")
+        if self.overall_score is None or self.verdict is None:
+            raise ValueError("an ok result needs overall_score and verdict")
+        if set(self.scores) != {c.name for c in self.rubric.criteria}:
+            raise ValueError("an ok result needs exactly one score per rubric criterion")
+        expected: Verdict = "PASS" if self.overall_score >= self.rubric.threshold else "FAIL"
+        if self.verdict != expected:
+            raise ValueError(
+                f"verdict {self.verdict} contradicts overall_score {self.overall_score} "
+                f"and threshold {self.rubric.threshold}"
+            )
+        return self
 
     @field_validator("tags")
     @classmethod

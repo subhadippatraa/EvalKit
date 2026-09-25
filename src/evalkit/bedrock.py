@@ -20,6 +20,16 @@ from evalkit.models import Rubric
 # ponytail: fixed output budget; very large rubrics may truncate -> JudgeOutputError
 MAX_TOKENS = 4096
 
+# Converse stop reasons that mean "no usable evaluation", by the sub-kind recorded on the attempt
+_STOP_KINDS = {
+    "max_tokens": ("truncated", "was truncated"),
+    "guardrail_intervened": ("refused", "was blocked by a guardrail"),
+    "content_filtered": ("refused", "was blocked by a content filter"),
+    "malformed_model_output": ("malformed_output", "was malformed"),
+    "malformed_tool_use": ("malformed_output", "had a malformed tool call"),
+    "model_context_window_exceeded": ("context_window", "exceeded the model context window"),
+}
+
 
 class BedrockJudge:
     provider = "bedrock"
@@ -97,10 +107,17 @@ class BedrockJudge:
         except BotoCoreError as e:
             raise JudgeError(f"Bedrock request failed: {e}") from e
 
-        if response.get("stopReason") == "max_tokens":
-            raise JudgeOutputError("judge response was truncated (stopReason=max_tokens)")
-        for block in response.get("output", {}).get("message", {}).get("content", []):
+        output = response.get("output")
+        stop = response.get("stopReason")
+        if stop in _STOP_KINDS:  # each is retried like any malformed output (P1 refines policy)
+            kind, what = _STOP_KINDS[stop]
+            raise JudgeOutputError(
+                f"judge response {what} (stopReason={stop})", kind=kind, raw=output
+            )
+        for block in (output or {}).get("message", {}).get("content", []):
             tool_use = block.get("toolUse")
             if tool_use and tool_use.get("name") == TOOL_NAME:
                 return tool_use.get("input")
-        raise JudgeOutputError(f"judge response contained no {TOOL_NAME} tool call")
+        raise JudgeOutputError(
+            f"judge response contained no {TOOL_NAME} tool call", kind="no_tool_call", raw=output
+        )

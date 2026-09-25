@@ -7,7 +7,6 @@ still depends only on the `Judge` Protocol. Requires the `bedrock-openai` extra
 (`pip install evalkit[bedrock-openai]`).
 """
 
-import json
 from typing import Any
 
 from openai import APIConnectionError as OpenAIAPIConnectionError
@@ -15,6 +14,7 @@ from openai import APIError as OpenAIAPIError
 from openai import APITimeoutError as OpenAIAPITimeoutError
 from openai import OpenAI
 
+from evalkit import safejson
 from evalkit.errors import JudgeError, JudgeOutputError, JudgeTimeoutError
 from evalkit.judge import (
     PROMPT_VERSION,
@@ -29,6 +29,12 @@ from evalkit.models import Rubric
 # ponytail: fixed output budget; very large rubrics may truncate -> JudgeOutputError
 MAX_TOKENS = 4096
 DEFAULT_BASE_URL = "https://bedrock-mantle.us-east-1.api.aws/v1"
+
+
+def _evidence(message: Any) -> Any:
+    """The assistant message as plain data, for the attempt record when the response is unusable."""
+    dump = getattr(message, "model_dump", None)
+    return dump(mode="json") if callable(dump) else None
 
 
 class BedrockOpenAIJudge:
@@ -97,15 +103,30 @@ class BedrockOpenAIJudge:
             raise JudgeError(f"Bedrock (OpenAI-compatible) API error: {e}") from e
 
         if not response.choices:
-            raise JudgeOutputError("judge response contained no choices")
+            raise JudgeOutputError("judge response contained no choices", kind="no_choices")
         choice = response.choices[0]
+        raw = _evidence(choice.message)
         if choice.finish_reason == "length":
-            raise JudgeOutputError("judge response was truncated (finish_reason=length)")
+            raise JudgeOutputError(
+                "judge response was truncated (finish_reason=length)", kind="truncated", raw=raw
+            )
+        if choice.finish_reason == "content_filter":
+            raise JudgeOutputError(
+                "judge response was blocked by a content filter (finish_reason=content_filter)",
+                kind="refused",
+                raw=raw,
+            )
 
         for call in choice.message.tool_calls or []:
             if call.function.name == TOOL_NAME:
                 try:
-                    return json.loads(call.function.arguments)
-                except json.JSONDecodeError as e:
-                    raise JudgeOutputError(f"judge tool arguments were not valid JSON: {e}") from e
-        raise JudgeOutputError(f"judge response contained no {TOOL_NAME} tool call")
+                    return safejson.loads(call.function.arguments)
+                except (ValueError, RecursionError) as e:  # incl. NaN/Infinity, duplicate keys
+                    raise JudgeOutputError(
+                        f"judge tool arguments were not valid JSON: {e}",
+                        kind="invalid_json",
+                        raw=call.function.arguments,
+                    ) from e
+        raise JudgeOutputError(
+            f"judge response contained no {TOOL_NAME} tool call", kind="no_tool_call", raw=raw
+        )

@@ -8,3 +8,8 @@ build/
 .env
 *.db
 .DS_Store
+*.db-wal
+*.db-shm
+*.db.bak-*
+*.db.spill/
+.hypothesis/
