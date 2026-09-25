@@ -139,6 +139,9 @@ Other calls: `evaluator.get(id)` (includes reviews), `evaluator.list(tag=None, l
 | `JudgeOutputError` | missing/malformed/out-of-range judge output, after one retry | yes, `status=error` |
 | `JudgeTimeoutError` | provider timeout (not retried) | yes, `status=error` |
 | `JudgeError` | any other provider failure (not retried) | yes, `status=error` |
+| `ScoringError` | internal scoring inconsistency (a `JudgeError`; never retried) | yes, `status=error` |
+| `StoreError` | judging succeeded but saving failed; `.result` holds the result, also spilled to `<db>.spill/` (`evalkit recover`) | no (spilled) |
+| `MigrationError` | database schema unrecognized, newer than this evalkit, or a migration failed | no |
 | `ConfigError` | bad/missing env config, or no judge/store configured | no |
 | `EvalKitError` | base class; also "not found" and invalid reviews | — |
 
@@ -186,6 +189,24 @@ Every result stores the rubric, its `rubric_version`, and the `judge_prompt_vers
 of the judge prompt template. Scores from different rubric or prompt versions shouldn't be
 compared directly.
 
+## Integrity guarantees (0.2.0)
+
+- **Scores are always finite and coherent.** Weights are bounded (`1e-6`..`1e6`); an `ok` result
+  always has a score in `[0, 1]` and a verdict that follows from it, enforced in Python and by a
+  database trigger.
+- **Evaluated content reaches the judge byte-for-byte**, between marker-delimited blocks that
+  the content cannot forge (no HTML escaping). Rubric text is kept in a separate trusted section.
+- **Every judge call is recorded** in `result.attempts`: a result that succeeded on its retry shows
+  the rejected first attempt and its (truncated) raw output. Provider errors are scrubbed of ARNs/keys.
+- **A rubric `version` label always means one rubric.** Reusing a label for different content raises
+  `RubricError` before the judge is called. Omit `version` to use the content hash.
+- **Inputs are bounded** (256 KiB per text field, 16 KiB metadata, 32 tags/criteria; see
+  `evalkit.Limits`) and validated before any paid call.
+- **Databases migrate themselves.** Opening an older database upgrades it (a `.bak-*` copy is
+  written first); unrecognized or newer databases are refused untouched. New files are `0600`, WAL mode.
+- **A paid result is not lost when saving fails**: `StoreError.result` plus a spill file; run
+  `evalkit recover` (or `evaluator.recover_spilled()`) once the database is healthy.
+
 ## Human review
 
 Any evaluation, including failed ones, can have any number of reviews. A review has a
@@ -203,7 +224,8 @@ evaluator.review(result.id, reviewer="bob", verdict="FAIL", comment="misses scop
 ```bash
 evalkit run --input input.json           # evaluate; prints the result as JSON
 evalkit get <id>                         # one evaluation + its reviews
-evalkit list [--tag X] [--limit N]       # newest first
+evalkit list [--tag X] [--limit N] [--cursor C]   # newest first; next_cursor on stderr
+evalkit recover                          # save results a failed database write left behind
 evalkit review <id> --reviewer alice --verdict PASS [--score 0.9] [--comment "..."]
 ```
 

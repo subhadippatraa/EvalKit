@@ -1067,7 +1067,7 @@ benchmark states the new figure rather than assuming it.
   `PRAGMA table_info` — 19 columns ⇒ v0 (pre-`context`) ⇒ `0001_legacy_add_context`
   (`ALTER TABLE … ADD COLUMN context`), 20 columns ⇒ v1 ⇒ baseline-stamp only. Unknown shape ⇒ refuse
   with a clear error, never guess.
-- **Downgrade guard:** DB `user_version` newer than the code ⇒ refuse to open.
+- **Downgrade guard:** a highest applied `schema_migrations.version` newer than the code ⇒ refuse to open. *(Implemented in P0 via `schema_migrations`, not `PRAGMA user_version`, to keep one source of truth.)*
 - **Backup:** before migrating a non-empty file DB, copy to `<db>.bak-<version>-<timestamp>`.
 - **Explicit column lists** in every INSERT (no positional VALUES).
 - Reviews generalization (`0003`) uses the standard SQLite table-rebuild (create new, copy, drop, rename)
@@ -1087,7 +1087,7 @@ benchmark states the new figure rather than assuming it.
 | failures by class | `evaluator_results(failure_class, failure_kind)` partial index `WHERE status='failed'` |
 | paired comparison | `case_results(run_id, case_id)` UNIQUE, `cases(dataset_version_id, case_key)` UNIQUE |
 | cost/latency | `attempts(case_result_id)`, `attempts(evaluator_result_id)` |
-| listing | keyset pagination on `(created_at, id)` — replaces `LIMIT` + `IN (?,…)` (F-12); `limit` validated (≤ 10,000) |
+| listing | keyset pagination on `(created_at, rowid)` *(P0 keeps `rowid` as the tie-break so insertion order is preserved; `rowid` does not survive `VACUUM`)* — replaces `LIMIT` + `IN (?,…)` (F-12); `limit` validated (≤ 10,000) |
 | tag filter | `case_tags(case_id, tag)` side table replaces `json_each` scans on hot paths |
 
 ### 11.4 Data-size controls
@@ -1526,7 +1526,7 @@ Goal: make the single-record path trustworthy *before* building on it.
 | **Finite-number invariants (F-1)** | `allow_inf_nan=False` on all floats; `Criterion.weight` upper bound; `Rubric.score` raises on non-finite; `EvaluationResult` validator; legacy-table status/score-coherence trigger (§6.5; SQLite stores NaN as NULL, so a NaN check is meaningless, coherence is the right invariant); CLI `json.load` `parse_constant` rejects `NaN/Infinity`. |
 | **Migration runner + explicit inserts (F-3)** | `schema_migrations`, legacy v0/v1 detection, backup, downgrade guard, named-column INSERT, WAL/`busy_timeout`/`0600`. |
 | **Injective encoding + prompt fingerprint (F-4, audit §11)** | nonce delimiters, marker-collision handling, rubric text validation/length caps, golden-render fingerprint replacing `PROMPT_VERSION` inputs, context wording per §6.4. |
-| **Attempt evidence (F-2, minimal)** | `attempts_json` column on `evaluations`: per attempt `{n, outcome, error, raw_payload (≤64 KB), duration_ms}`; `attempts` count; rejected raw payload retained. |
+| **Attempt evidence (F-2, minimal)** | `attempts_json` column on `evaluations`: per attempt `{n, outcome, error, raw_payload (≤64 KB), duration_ms}`; the attempt count is `len(attempts)` (no separate column); rejected raw payload retained. |
 | **Rubric version integrity (F-7)** | `rubric_versions(version, content_hash)`; saving a different content under an existing version ⇒ `RubricError`. |
 | **Store failure path (F-13)** | spill file; `StoreError(result=…)`; test the currently uncovered branch. |
 | **Input limits (F-10, F-12)** | §14.2 limits at `evaluate()` and CLI; streaming file read with size cap and explicit UTF-8; `list(limit)` validated + keyset pagination. |

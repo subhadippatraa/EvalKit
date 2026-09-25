@@ -110,9 +110,9 @@ class Evaluator:
 - `context`: optional supporting material the model output may be checked
   against (e.g. source documents, a spec, background text) -- distinct from
   `reference_output` (a gold *answer*, not grounding material). Rendered into
-  its own `<context>` prompt block, escaped the same way as `model_output`/
-  `reference_output`; omitted (`None`) renders as a fixed placeholder so the
-  prompt shape stays stable either way. Persisted on `EvaluationResult` for
+  its own delimited `context` block, encoded like `model_output`/
+  `reference_output` (see [0.2.0 changes](#020-p0-hardening-changes)); omitted
+  (`None`) is stated outside any block as `context: (not provided)`. Persisted on `EvaluationResult` for
   the same auditability reason `reference_output` is. *(Added during
   implementation, generic scope -- not domain-specific.)*
 
@@ -169,7 +169,9 @@ Provider-agnostic helpers, shared by all current and future judges:
   optional reference output, criterion descriptions with scales.
 - `render_prompt(prompt, model_output, reference_output, context, rubric) -> str`.
 - `output_schema(rubric) -> dict`: the JSON Schema below.
-- `PROMPT_VERSION = sha256(PROMPT_TEMPLATE + NO_REFERENCE + NO_CONTEXT + TOOL_NAME + TOOL_DESCRIPTION)[:12]`.
+- `PROMPT_VERSION = compute_prompt_version()`: a hash of the static prompt text **and** of a fixed
+  fixture rendered through the real `render_prompt`/`output_schema` code, so a change to rendering
+  behavior changes the version (0.2.0; before, only string constants were hashed).
 
 ## Bedrock judge integration (`bedrock.py`)
 
@@ -256,7 +258,7 @@ EvalKitError
 | Provider error | **no** [OD-1] | yes, `status=error` | `JudgeError` |
 | Timeout | **no** [OD-1] | yes, `status=error` | `JudgeTimeoutError` |
 | Provider error/timeout during the malformed-output retry | no | yes, `status=error` | that error |
-| SQLite failure | no | n/a | `sqlite3.Error` propagates |
+| Storage failure after judging | no | result spilled to `<db>.spill/` | `StoreError` (an `sqlite3.Error`) carrying `.result` |
 
 - A malformed result is never accepted or stored as `ok`.
 - Raised judge errors carry `.evaluation_id` of the persisted error row.
@@ -429,7 +431,7 @@ the pytest suite.
   with strict (non-coercing) checks.
 - Scoring and verdict are computed in Python, never by the LLM.
 - Only malformed output is retried, once, by `Evaluator`.
-- Prompt version = hash of the shared template and tool definition text.
+- Prompt version = fingerprint of the static text plus a golden render of a fixture.
 - Rubric version = explicit or content hash.
 - Two tables; per-criterion scores, metadata and tags stored as JSON columns.
 - Judge-stage failures are persisted, then raised.
@@ -496,3 +498,58 @@ changing approved design:
   parameters up front (clearer error than a bare `TypeError`), and
   `list --limit` rejects non-positive values instead of silently returning
   every row (SQLite treats `LIMIT -1` as "no limit").
+
+## 0.2.0 (P0 hardening) changes
+
+Implements P0 of [`TARGET-ARCHITECTURE.md`](TARGET-ARCHITECTURE.md) for the single-record path;
+findings refer to [`PRODUCTION-AUDIT.md`](PRODUCTION-AUDIT.md). These **supersede** any earlier
+statement in this document.
+
+- **Numeric safety (F-1).** `Criterion.weight` is finite and within `[1e-6, 1e6]`; scale bounds are
+  within +/-1,000,000; all float fields reject NaN/Infinity. `Rubric.score` raises `ScoringError`
+  (a `JudgeError`, persisted, never retried) if the result is not a finite value in `[0, 1]`.
+  `EvaluationResult` enforces coherence: `ok` <=> score + verdict (following the rubric threshold) +
+  one score per criterion + no error; `error` <=> message and none of those. The `evaluations`
+  table has an INSERT trigger enforcing the same (SQLite stores NaN as NULL, which is how the
+  original bug produced `ok`/NULL rows).
+- **Migrations (F-3).** `evalkit.migrations`: `schema_migrations` table with checksums; each
+  migration in its own `BEGIN IMMEDIATE` transaction; legacy databases (v0: before `context`;
+  v1: 0.1.0) are detected by column set and adopted; unrecognized, newer, or tampered databases
+  are refused; a consistent backup `<db>.bak-v<N>-<timestamp>` is written before changing a
+  non-empty file. All INSERTs name their columns. New files are `0600` and use WAL with a 10 s busy
+  timeout (the WAL switch is retried: it needs a lock the busy timeout does not cover).
+- **Lossless prompt encoding (F-4).** `_escape` is gone. Each of `prompt`, `model_output`,
+  `reference_output`, `context` is placed verbatim between
+  `<<<EVALKIT:<marker> NAME>>>` / `<<<END:<marker> NAME>>>` lines. `marker` is 16 hex characters of
+  a SHA-256 over the content, re-derived with a counter if it occurs in any content, so a delimiter
+  line cannot be forged from inside evaluated content. Rubric descriptions, labels and versions are
+  validated (length, printable, no delimiter text) and rendered in a separate trusted section after
+  the data. Prompt bytes changed, so `judge_prompt_version` changed: pre-0.2.0 and 0.2.0
+  results are deliberately not comparable. The `context` instruction now says context is the
+  source of truth for support; that wording is **not yet validated against a live judge**.
+- **Attempt evidence (F-2).** `EvaluationResult.attempts` (`evaluations.attempts_json`): one
+  `Attempt` per judge call with outcome (`ok`, `invalid_output`, `timeout`, `provider_error`,
+  `scoring_error`, `unexpected_error`), timing, scrubbed error, provider `kind`
+  (`truncated`, `refused`, `malformed_output`, `context_window`, `no_tool_call`, `invalid_json`),
+  and, for failed attempts, the rejected/partial output (truncated to 64 KB, with the SHA-256 of the
+  full text). Rows written before 0.2.0 read as `attempts=[]` (unknown). Retry policy is unchanged.
+- **Rubric identity (F-7).** `Rubric.content_hash` (full SHA-256 of content excluding `version`;
+  the auto version is its first 12 hex characters, unchanged). `rubric_versions` binds each version
+  label to one content hash; `Evaluator` checks it **before** the judge call and `save()` re-checks.
+  Existing databases are backfilled (earliest row wins; conflicts are logged, rows untouched).
+- **Limits (F-10).** `Limits` (per `Evaluator`): 256 KiB per text field (UTF-8 bytes), 16 KiB
+  metadata, 32 tags (128 chars each); rubric: 32 criteria, 2,000-char descriptions, 32 labels of
+  <= 64 printable chars. Unpaired surrogates are refused up front. CLI input: 8 MiB cap, UTF-8,
+  strict JSON (no NaN/Infinity/`1e999`, no duplicate keys).
+- **Pagination (F-12).** `limit` is validated (1..10,000); `list_page()` returns
+  `(results, next_cursor)` using keyset pagination on `(created_at, rowid)` (a cursor should not
+  outlive a `VACUUM`); reviews are loaded in chunks of 500. CLI `list --cursor`.
+- **Storage failure (F-13).** A failed `save()` raises `StoreError` (also an `sqlite3.Error`,
+  preserving the old contract) carrying the complete `.result`, and writes it to `<db>.spill/<id>.json`
+  (atomic, `0600`). `recover_spilled()` / `evalkit recover` replays it; opening a store with waiting
+  spill files logs a warning.
+- **Errors and CLI.** New `ScoringError`, `StoreError`, `MigrationError`. Provider stop reasons
+  `guardrail_intervened`, `content_filtered`, `malformed_*`, `model_context_window_exceeded` are
+  distinct kinds (previously "no tool call"). Error text is scrubbed of ARNs, keys and bearer
+  tokens (`evalkit.redact`). The CLI no longer converts an internal `TypeError` into "invalid input
+  file", and reports database errors cleanly.
