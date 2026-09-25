@@ -12,9 +12,11 @@ from itertools import islice
 from evalkit import safejson
 from evalkit.errors import EvalKitError
 from evalkit.evaluator import Evaluator
+from evalkit.failures import FailureClass
 from evalkit.kit import EvalKit
 from evalkit.limits import MAX_INPUT_FILE_BYTES
 from evalkit.redact import scrub
+from evalkit.runs import TRANSITIONS
 
 # keys evaluate() accepts, for a clear "unknown key" message before calling it
 _RUN_SIGNATURE = inspect.signature(Evaluator.evaluate)
@@ -63,6 +65,26 @@ def _parser() -> argparse.ArgumentParser:
     lint.add_argument("ref")
     ver = dsub.add_parser("verify", help="recompute hashes from stored rows (exit 1 on mismatch)")
     ver.add_argument("ref")
+
+    runs = sub.add_parser("runs", help="runs and their recorded results")
+    rsub = runs.add_subparsers(dest="runs_command", required=True)
+    create = rsub.add_parser("create", help="freeze a run config against a dataset version")
+    create.add_argument("dataset", help="dataset ref: name, name@latest, name@3, name@<hash>")
+    create.add_argument("--config", required=True, help="JSON file: a RunConfig")
+    create.add_argument("--name")
+    create.add_argument("--idempotency-key")
+    rls = rsub.add_parser("list", help="list runs, newest first")
+    rls.add_argument("--dataset", help="only runs of this dataset version")
+    rls.add_argument("--status", choices=sorted(TRANSITIONS))
+    rls.add_argument("--limit", type=_positive_int, default=20)
+    rshow = rsub.add_parser("show", help="show a run with its progress")
+    rshow.add_argument("id")
+    rfail = rsub.add_parser("failures", help="list failures, optionally of one class")
+    rfail.add_argument("id")
+    rfail.add_argument("--class", dest="failure_class", choices=[c.value for c in FailureClass])
+    rfail.add_argument("--limit", type=_positive_int, default=100)
+    rver = rsub.add_parser("verify", help="recheck a run (exit 1 on mismatch)")
+    rver.add_argument("id")
 
     review = sub.add_parser("review", help="add a human review")
     review.add_argument("id")
@@ -131,6 +153,44 @@ def _dataset_command(args: argparse.Namespace) -> tuple[int, object]:
         kit.close()
 
 
+def _runs_command(args: argparse.Namespace) -> tuple[int, object]:
+    """(exit code, JSON-able output) for `evalkit runs ...`."""
+    kit = EvalKit.from_env()
+    try:
+        rs = kit.runs
+        match args.runs_command:
+            case "create":
+                config = _read_input(args.config)
+                if config is None:
+                    return 2, None
+                run = rs.create(
+                    args.dataset,
+                    config,
+                    name=args.name,
+                    idempotency_key=args.idempotency_key,
+                )
+                return 0, run.model_dump(mode="json")
+            case "list":
+                runs = rs.list(dataset_ref=args.dataset, status=args.status, limit=args.limit)
+                return 0, [r.model_dump(mode="json") for r in runs]
+            case "show":
+                return 0, {
+                    "run": rs.get(args.id).model_dump(mode="json"),
+                    "counts": asdict(rs.counts(args.id)),
+                    "failure_counts": [asdict(c) for c in rs.failure_counts(args.id)],
+                }
+            case "failures":
+                found = rs.failures(args.id, failure_class=args.failure_class, limit=args.limit)
+                return 0, [
+                    {**asdict(f), "failure": f.failure.model_dump(mode="json")} for f in found
+                ]
+            case _:  # verify
+                report = rs.verify(args.id)
+                return (0 if report.ok else 1), asdict(report)
+    finally:
+        kit.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -159,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"next_cursor: {next_cursor}", file=sys.stderr)
         elif args.command == "dataset":
             code, output = _dataset_command(args)
+            if output is None:
+                return code
+            print(json.dumps(output, indent=2))
+            return code
+        elif args.command == "runs":
+            code, output = _runs_command(args)
             if output is None:
                 return code
             print(json.dumps(output, indent=2))

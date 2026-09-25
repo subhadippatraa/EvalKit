@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -21,13 +20,12 @@ from evalkit.errors import (
     ScoringError,
     StoreError,
 )
+from evalkit.evidence import capture_evidence, clip
 from evalkit.judge import Judge
 from evalkit.limits import (
     MAX_ERROR_CHARS,
-    MAX_EVIDENCE_BYTES,
     MAX_TAG_CHARS,
     Limits,
-    truncate_utf8,
 )
 from evalkit.models import (
     Attempt,
@@ -193,7 +191,7 @@ class Evaluator:
                 id=draft.id,
                 created_at=draft.created_at,
                 status="error",
-                error=_clip(f"{type(error).__name__}: {error}", MAX_ERROR_CHARS),
+                error=clip(f"{type(error).__name__}: {error}", MAX_ERROR_CHARS),
                 latency_ms=latency_ms,
                 attempts=attempts,
                 **common,
@@ -353,12 +351,6 @@ def _float_env(
     return number
 
 
-def _clip(text: str, max_chars: int) -> str:
-    # text may hold unpaired surrogates from a provider; make it encodable before it is stored
-    text = text.encode("utf-8", "replace").decode("utf-8")
-    return text if len(text) <= max_chars else text[: max_chars - 1] + "\u2026"
-
-
 def _outcome(exc: JudgeError) -> AttemptOutcome:
     if isinstance(exc, JudgeOutputError):
         return "invalid_output"
@@ -375,24 +367,14 @@ def _attempt(
     """Evidence for one judge call. The rejected/partial output is kept (truncated) only for
     failed attempts; a successful attempt keeps just a hash, its content is the stored scores."""
     evidence = raw if raw is not None else getattr(exc, "raw", None)
-    text = sha = None
-    truncated = False
-    if evidence is not None:
-        try:
-            full = json.dumps(evidence, ensure_ascii=False, default=repr)
-        except (TypeError, ValueError):  # e.g. circular structure
-            full = repr(evidence)
-        full = full.encode("utf-8", "replace").decode("utf-8")
-        sha = hashlib.sha256(full.encode()).hexdigest()
-        if exc is not None:
-            text, truncated = truncate_utf8(full, MAX_EVIDENCE_BYTES)
+    text, sha, truncated = capture_evidence(evidence, keep_text=exc is not None)
     return Attempt(
         n=n,
         outcome="ok" if exc is None else _outcome(exc),
         started_at=started_at,
         duration_ms=round(seconds * 1000),
         error_type=None if exc is None else type(exc).__name__,
-        error=None if exc is None else _clip(str(exc), MAX_ERROR_CHARS),
+        error=None if exc is None else clip(str(exc), MAX_ERROR_CHARS),
         kind=getattr(exc, "kind", None),
         raw=text,
         raw_sha256=sha,

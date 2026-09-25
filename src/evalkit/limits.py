@@ -29,6 +29,11 @@ MAX_DOC_IDS = 1000  # per case
 MAX_RELEVANCE_GRADE = 100
 MAX_ISSUES = 100  # validation problems reported before an import gives up scanning
 
+MAX_CONFIG_BYTES = 256 * 1024  # a frozen RunConfig, JSON
+MAX_RUN_EVALUATORS = 32
+MAX_ATTEMPTS = 100  # attempts recorded with one result
+MAX_METRICS = 256  # per evaluator result
+
 MAX_EVIDENCE_BYTES = 64 * 1024  # raw judge output kept per failed attempt
 MAX_ERROR_CHARS = 2000
 

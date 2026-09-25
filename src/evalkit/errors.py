@@ -33,6 +33,18 @@ class DatasetError(EvalKitError):
         self.issues = list(issues)
 
 
+class RunError(EvalKitError):
+    """A run or one of its results could not be created, changed, recorded or read.
+
+    Raised for anything the run domain forbids: a case from another dataset version, a second
+    result for the same case, a result on a run that is not running, an illegal status change.
+    """
+
+
+class DuplicateResultError(RunError):
+    """A result already exists for this case (or evaluator) in this run; results are write-once."""
+
+
 class JudgeError(EvalKitError):
     """Judge provider/API/connection failure. Persisted as an error row, then raised.
 

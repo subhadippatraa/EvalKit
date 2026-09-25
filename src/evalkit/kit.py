@@ -4,7 +4,8 @@
     result = kit.datasets.import_jsonl("support-qa", "cases.jsonl")
     for case in kit.datasets.cases("support-qa@latest"): ...
 
-Runs, comparison and reports will hang off the same object in later phases. The single-record
+`kit.runs` records runs and their results (no execution yet); comparison and reports will
+hang off the same object in later phases. The single-record
 `Evaluator` API is separate and unchanged.
 """
 
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from evalkit.datasets import DatasetService
 from evalkit.limits import Limits
+from evalkit.runs import RunService
 from evalkit.store import SQLiteStore, default_db_path
 
 
@@ -22,6 +24,7 @@ class EvalKit:
         self.store = store
         self.limits = limits or Limits()
         self.datasets = DatasetService(store, self.limits)
+        self.runs = RunService(store, self.datasets, self.limits)
 
     @classmethod
     def open(cls, path: str | Path, limits: Limits | None = None) -> EvalKit:

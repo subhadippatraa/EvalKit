@@ -161,6 +161,307 @@ BEGIN SELECT RAISE(ABORT, 'dataset versions are immutable once sealed'); END;
 """
 
 
+# Runs and results. A run pins exactly one sealed dataset version and a frozen config; its results
+# are write-once evidence. As with datasets, the rules live in the database (CHECKs and triggers)
+# as well as in Python, so a bug or a raw connection cannot store an impossible state.
+#
+# NULL pitfall (see DATASETS_SQL): a CHECK that evaluates to NULL passes. Every disjunct below
+# starts with a non-NULL test on `status`, and every `IN (...)` is guarded by `IS NOT NULL`.
+# Triggers use COALESCE around lookups for the same reason: NOT(NULL) is NULL, not true.
+#
+# Where a fact spans tables (a case belongs to the run's dataset version; an evaluator result's
+# run is its case result's run) a trigger checks it rather than denormalizing a column onto the
+# biggest table. `run_id` on evaluator_results/metrics is kept because aggregation needs it.
+RUNS_SQL = """
+CREATE TABLE runs (
+  id                 TEXT PRIMARY KEY,
+  dataset_version_id TEXT NOT NULL REFERENCES dataset_versions(id),
+  name               TEXT,
+  status             TEXT NOT NULL CHECK (
+    status IN ('created','running','succeeded','partial','failed','cancelled')),
+  stop_reason        TEXT,
+  config_json        TEXT NOT NULL,
+  identity_hash      TEXT NOT NULL CHECK (length(identity_hash) = 64),
+  exec_hash          TEXT NOT NULL CHECK (length(exec_hash) = 64),
+  evaluator_count    INTEGER NOT NULL CHECK (evaluator_count >= 0),
+  environment_json   TEXT NOT NULL DEFAULT '{}',
+  idempotency_key    TEXT UNIQUE,
+  created_at         TEXT NOT NULL,
+  started_at         TEXT,
+  finished_at        TEXT,
+  CHECK (
+    (status = 'created' AND started_at IS NULL AND finished_at IS NULL AND stop_reason IS NULL)
+    OR (status = 'running' AND started_at IS NOT NULL AND finished_at IS NULL
+        AND stop_reason IS NULL)
+    OR (status = 'succeeded' AND started_at IS NOT NULL AND finished_at IS NOT NULL
+        AND stop_reason IS NULL)
+    OR (status IN ('partial','failed','cancelled') AND started_at IS NOT NULL
+        AND finished_at IS NOT NULL AND stop_reason IS NOT NULL)
+  )
+);
+CREATE INDEX idx_runs_dataset_version ON runs(dataset_version_id, created_at);
+CREATE INDEX idx_runs_identity ON runs(identity_hash);
+
+CREATE TABLE run_evaluators (
+  run_id        TEXT NOT NULL REFERENCES runs(id),
+  evaluator_key TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  version       INTEGER NOT NULL CHECK (version >= 1),
+  spec_json     TEXT NOT NULL,
+  PRIMARY KEY (run_id, evaluator_key)
+) WITHOUT ROWID;
+
+CREATE TABLE case_results (
+  id              TEXT PRIMARY KEY,
+  run_id          TEXT NOT NULL REFERENCES runs(id),
+  case_id         TEXT NOT NULL REFERENCES cases(id),
+  status          TEXT NOT NULL CHECK (status IN ('pending','complete','failed')),
+  output          TEXT,
+  retrieved_json  TEXT,
+  failure_class   TEXT,
+  failure_kind    TEXT,
+  failure_message TEXT,
+  retryable       INTEGER CHECK (retryable IS NULL OR retryable IN (0, 1)),
+  created_at      TEXT NOT NULL,
+  started_at      TEXT,
+  finished_at     TEXT,
+  duration_ms     INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  UNIQUE (run_id, case_id),
+  CHECK (
+    (status = 'pending' AND output IS NULL AND retrieved_json IS NULL
+        AND failure_class IS NULL AND failure_kind IS NULL AND failure_message IS NULL
+        AND retryable IS NULL AND started_at IS NULL AND finished_at IS NULL
+        AND duration_ms IS NULL)
+    OR (status = 'complete' AND output IS NOT NULL
+        AND failure_class IS NULL AND failure_kind IS NULL AND failure_message IS NULL
+        AND retryable IS NULL AND finished_at IS NOT NULL)
+    OR (status = 'failed' AND output IS NULL AND retrieved_json IS NULL
+        AND failure_class IS NOT NULL AND failure_class IN ('input','target','infrastructure')
+        AND failure_kind IS NOT NULL AND failure_message IS NOT NULL
+        AND retryable IS NOT NULL AND finished_at IS NOT NULL)
+  )
+);
+CREATE INDEX idx_case_results_status ON case_results(run_id, status);
+CREATE INDEX idx_case_results_failures ON case_results(run_id, failure_class, failure_kind)
+  WHERE status = 'failed';
+
+CREATE TABLE evaluator_results (
+  id              TEXT PRIMARY KEY,
+  case_result_id  TEXT NOT NULL REFERENCES case_results(id),
+  run_id          TEXT NOT NULL,
+  evaluator_key   TEXT NOT NULL,
+  status          TEXT NOT NULL CHECK (status IN ('ok','not_applicable','failed','skipped')),
+  verdict         TEXT CHECK (verdict IS NULL OR verdict IN ('PASS','FAIL','UNCERTAIN')),
+  detail_json     TEXT NOT NULL DEFAULT '{}',
+  failure_class   TEXT,
+  failure_kind    TEXT,
+  failure_message TEXT,
+  retryable       INTEGER CHECK (retryable IS NULL OR retryable IN (0, 1)),
+  created_at      TEXT NOT NULL,
+  duration_ms     INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  UNIQUE (case_result_id, evaluator_key),
+  FOREIGN KEY (run_id, evaluator_key) REFERENCES run_evaluators(run_id, evaluator_key),
+  CHECK (
+    (status = 'ok' AND failure_class IS NULL AND failure_kind IS NULL
+        AND failure_message IS NULL AND retryable IS NULL)
+    OR (status IN ('not_applicable','skipped') AND verdict IS NULL AND failure_class IS NULL
+        AND failure_kind IS NULL AND failure_message IS NULL AND retryable IS NULL)
+    OR (status = 'failed' AND verdict IS NULL
+        AND failure_class IS NOT NULL AND failure_class IN ('input','evaluator','infrastructure')
+        AND failure_kind IS NOT NULL AND failure_message IS NOT NULL AND retryable IS NOT NULL)
+  )
+);
+CREATE INDEX idx_evaluator_results_key ON evaluator_results(run_id, evaluator_key, status);
+CREATE INDEX idx_evaluator_results_failures
+  ON evaluator_results(run_id, failure_class, failure_kind) WHERE status = 'failed';
+
+CREATE TABLE metrics (
+  evaluator_result_id TEXT NOT NULL REFERENCES evaluator_results(id),
+  run_id              TEXT NOT NULL,
+  evaluator_key       TEXT NOT NULL,
+  name                TEXT NOT NULL,
+  -- NaN is stored as NULL by SQLite, which NOT NULL refuses; the range refuses +/-Infinity
+  value               REAL NOT NULL CHECK (value BETWEEN -1.7976931348623157e308
+                                                     AND 1.7976931348623157e308),
+  PRIMARY KEY (evaluator_result_id, name)
+) WITHOUT ROWID;
+CREATE INDEX idx_metrics_aggregate ON metrics(run_id, evaluator_key, name);
+
+CREATE TABLE attempts (
+  id                  TEXT PRIMARY KEY,
+  case_result_id      TEXT REFERENCES case_results(id),
+  evaluator_result_id TEXT REFERENCES evaluator_results(id),
+  n                   INTEGER NOT NULL CHECK (n >= 1),
+  provider            TEXT,
+  model               TEXT,
+  started_at          TEXT NOT NULL,
+  duration_ms         INTEGER NOT NULL CHECK (duration_ms >= 0),
+  outcome             TEXT NOT NULL CHECK (outcome IN ('ok','failed')),
+  error_class         TEXT,
+  error_kind          TEXT,
+  error_type          TEXT,
+  error               TEXT,
+  http_status         INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
+  request_id          TEXT,
+  input_tokens        INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+  output_tokens       INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+  raw_payload         TEXT,
+  raw_sha256          TEXT,
+  raw_truncated       INTEGER NOT NULL DEFAULT 0 CHECK (raw_truncated IN (0, 1)),
+  -- exactly one owner: a target call (case result) or an evaluator call (evaluator result)
+  CHECK ((case_result_id IS NULL) + (evaluator_result_id IS NULL) = 1),
+  CHECK (
+    (outcome = 'ok' AND error_class IS NULL AND error_kind IS NULL AND raw_payload IS NULL)
+    OR (outcome = 'failed' AND error_class IS NOT NULL
+        AND error_class IN ('input','target','evaluator','infrastructure')
+        AND error_kind IS NOT NULL)
+  ),
+  CHECK (raw_payload IS NULL OR raw_sha256 IS NOT NULL)
+);
+CREATE UNIQUE INDEX ux_attempts_case_result ON attempts(case_result_id, n)
+  WHERE case_result_id IS NOT NULL;
+CREATE UNIQUE INDEX ux_attempts_evaluator_result ON attempts(evaluator_result_id, n)
+  WHERE evaluator_result_id IS NOT NULL;
+
+-- runs -----------------------------------------------------------------------------------
+CREATE TRIGGER runs_insert BEFORE INSERT ON runs
+WHEN NEW.status <> 'created'
+  OR (SELECT sealed FROM dataset_versions WHERE id = NEW.dataset_version_id) IS NOT 1
+BEGIN SELECT RAISE(ABORT, 'a run starts as created, on a sealed dataset version'); END;
+
+CREATE TRIGGER runs_config_immutable BEFORE UPDATE ON runs
+WHEN NEW.id IS NOT OLD.id OR NEW.dataset_version_id IS NOT OLD.dataset_version_id
+  OR NEW.name IS NOT OLD.name OR NEW.config_json IS NOT OLD.config_json
+  OR NEW.identity_hash IS NOT OLD.identity_hash OR NEW.exec_hash IS NOT OLD.exec_hash
+  OR NEW.evaluator_count IS NOT OLD.evaluator_count
+  OR NEW.environment_json IS NOT OLD.environment_json
+  OR NEW.idempotency_key IS NOT OLD.idempotency_key OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.started_at IS NOT NULL AND NEW.started_at IS NOT OLD.started_at)
+BEGIN SELECT RAISE(ABORT, 'a run''s configuration is frozen'); END;
+
+CREATE TRIGGER runs_legal_transition BEFORE UPDATE ON runs
+WHEN NOT (
+  (OLD.status = 'created' AND NEW.status = 'running')
+  OR (OLD.status = 'running' AND NEW.status IN ('succeeded','partial','cancelled','failed'))
+  OR (OLD.status IN ('partial','cancelled','failed') AND NEW.status = 'running')
+)
+BEGIN SELECT RAISE(ABORT, 'illegal run status change'); END;
+
+CREATE TRIGGER runs_succeeded_needs_every_case BEFORE UPDATE ON runs
+WHEN NEW.status = 'succeeded'
+  AND (SELECT COUNT(*) FROM case_results WHERE run_id = OLD.id AND status <> 'pending')
+      <> (SELECT case_count FROM dataset_versions WHERE id = OLD.dataset_version_id)
+BEGIN SELECT RAISE(ABORT, 'a run succeeds only when every case has a terminal result'); END;
+
+CREATE TRIGGER runs_no_delete BEFORE DELETE ON runs
+BEGIN SELECT RAISE(ABORT, 'runs are permanent records'); END;
+
+-- the run records how many evaluators it has, so no more can be added afterwards (deleting is
+-- refused too), even while it is still `created`
+CREATE TRIGGER run_evaluators_insert BEFORE INSERT ON run_evaluators
+WHEN COALESCE((SELECT status FROM runs WHERE id = NEW.run_id), '') <> 'created'
+  OR (SELECT COUNT(*) FROM run_evaluators WHERE run_id = NEW.run_id)
+     >= COALESCE((SELECT evaluator_count FROM runs WHERE id = NEW.run_id), 0)
+BEGIN SELECT RAISE(ABORT, 'evaluators are fixed when the run is created'); END;
+
+CREATE TRIGGER run_evaluators_no_update BEFORE UPDATE ON run_evaluators
+BEGIN SELECT RAISE(ABORT, 'run evaluators are immutable'); END;
+
+CREATE TRIGGER run_evaluators_no_delete BEFORE DELETE ON run_evaluators
+BEGIN SELECT RAISE(ABORT, 'run evaluators are immutable'); END;
+
+-- case results ---------------------------------------------------------------------------
+CREATE TRIGGER case_results_same_dataset_version BEFORE INSERT ON case_results
+WHEN NOT EXISTS (
+  SELECT 1 FROM runs r JOIN cases c ON c.dataset_version_id = r.dataset_version_id
+  WHERE r.id = NEW.run_id AND c.id = NEW.case_id
+)
+BEGIN SELECT RAISE(ABORT, 'case is not part of the run''s dataset version'); END;
+
+CREATE TRIGGER case_results_run_accepts_insert BEFORE INSERT ON case_results
+WHEN NOT (
+  (NEW.status = 'pending'
+     AND COALESCE((SELECT status FROM runs WHERE id = NEW.run_id), '') IN ('created','running'))
+  OR (NEW.status <> 'pending'
+     AND COALESCE((SELECT status FROM runs WHERE id = NEW.run_id), '') = 'running')
+)
+BEGIN SELECT RAISE(ABORT, 'the run is not accepting this result (results need a running run)'); END;
+
+CREATE TRIGGER case_results_write_once BEFORE UPDATE ON case_results
+WHEN OLD.status <> 'pending' OR NEW.status = 'pending'
+  OR NEW.id IS NOT OLD.id OR NEW.run_id IS NOT OLD.run_id OR NEW.case_id IS NOT OLD.case_id
+  OR NEW.created_at IS NOT OLD.created_at
+  OR COALESCE((SELECT status FROM runs WHERE id = OLD.run_id), '') <> 'running'
+BEGIN SELECT RAISE(ABORT, 'case results are write-once, and only on a running run'); END;
+
+CREATE TRIGGER case_results_no_delete BEFORE DELETE ON case_results
+BEGIN SELECT RAISE(ABORT, 'case results are permanent records'); END;
+
+-- evaluator results ----------------------------------------------------------------------
+CREATE TRIGGER evaluator_results_run_matches BEFORE INSERT ON evaluator_results
+WHEN NEW.run_id IS NOT (SELECT run_id FROM case_results WHERE id = NEW.case_result_id)
+BEGIN SELECT RAISE(ABORT, 'evaluator result must carry its case result''s run'); END;
+
+CREATE TRIGGER evaluator_results_run_running BEFORE INSERT ON evaluator_results
+WHEN COALESCE((SELECT status FROM runs WHERE id = NEW.run_id), '') <> 'running'
+BEGIN SELECT RAISE(ABORT, 'results need a running run'); END;
+
+-- a target failure is never scored: a failed case result only has `skipped` evaluator results,
+-- a pending one has none, and `skipped` is reserved for a failed case result
+CREATE TRIGGER evaluator_results_fit_case_result BEFORE INSERT ON evaluator_results
+WHEN NOT (
+  (COALESCE((SELECT status FROM case_results WHERE id = NEW.case_result_id), '') = 'complete'
+     AND NEW.status IN ('ok','not_applicable','failed'))
+  OR (COALESCE((SELECT status FROM case_results WHERE id = NEW.case_result_id), '') = 'failed'
+     AND NEW.status = 'skipped')
+)
+BEGIN SELECT RAISE(ABORT, 'evaluator result does not fit its case result''s status'); END;
+
+CREATE TRIGGER evaluator_results_no_update BEFORE UPDATE ON evaluator_results
+BEGIN SELECT RAISE(ABORT, 'evaluator results are write-once'); END;
+
+CREATE TRIGGER evaluator_results_no_delete BEFORE DELETE ON evaluator_results
+BEGIN SELECT RAISE(ABORT, 'evaluator results are permanent records'); END;
+
+-- metrics --------------------------------------------------------------------------------
+CREATE TRIGGER metrics_need_ok_result BEFORE INSERT ON metrics
+WHEN NOT EXISTS (
+  SELECT 1 FROM evaluator_results e JOIN runs r ON r.id = e.run_id
+  WHERE e.id = NEW.evaluator_result_id AND e.status = 'ok'
+    AND e.run_id = NEW.run_id AND e.evaluator_key = NEW.evaluator_key AND r.status = 'running'
+)
+BEGIN SELECT RAISE(ABORT, 'metrics belong to an ok evaluator result of a running run'); END;
+
+CREATE TRIGGER metrics_no_update BEFORE UPDATE ON metrics
+BEGIN SELECT RAISE(ABORT, 'metrics are write-once'); END;
+
+CREATE TRIGGER metrics_no_delete BEFORE DELETE ON metrics
+BEGIN SELECT RAISE(ABORT, 'metrics are permanent records'); END;
+
+-- attempts -------------------------------------------------------------------------------
+CREATE TRIGGER attempts_owner_running BEFORE INSERT ON attempts
+WHEN NOT EXISTS (
+  SELECT 1 FROM runs r WHERE r.status = 'running' AND r.id = COALESCE(
+    (SELECT run_id FROM case_results WHERE id = NEW.case_result_id),
+    (SELECT run_id FROM evaluator_results WHERE id = NEW.evaluator_result_id))
+)
+BEGIN SELECT RAISE(ABORT, 'attempts belong to a result of a running run'); END;
+
+-- a target call cannot fail as an evaluator, nor an evaluator call as the target
+CREATE TRIGGER attempts_class_fits_owner BEFORE INSERT ON attempts
+WHEN (NEW.case_result_id IS NOT NULL AND NEW.error_class = 'evaluator')
+  OR (NEW.evaluator_result_id IS NOT NULL AND NEW.error_class = 'target')
+BEGIN SELECT RAISE(ABORT, 'attempt failure class does not fit what was called'); END;
+
+CREATE TRIGGER attempts_no_update BEFORE UPDATE ON attempts
+BEGIN SELECT RAISE(ABORT, 'attempts are write-once'); END;
+
+CREATE TRIGGER attempts_no_delete BEFORE DELETE ON attempts
+BEGIN SELECT RAISE(ABORT, 'attempts are permanent records'); END;
+"""
+
+
 def _backfill_rubric_versions(conn: sqlite3.Connection) -> None:
     """Register the rubric version -> content hash of every existing row (earliest first wins).
 
@@ -216,6 +517,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline", BASELINE_SQL),
     Migration(2, "p0_hardening", P0_SQL, _backfill_rubric_versions),
     Migration(3, "dataset_foundation", DATASETS_SQL),
+    Migration(4, "runs_and_results", RUNS_SQL),
 )
 
 _V1_EVALUATION_COLUMNS = frozenset(

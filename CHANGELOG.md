@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased - P1 dataset foundation
+## Unreleased - P1 (in progress)
+
+### Runs, results, attempts, failure taxonomy
+
+- New: the persistent run domain (`EvalKit.runs`, `evalkit runs create|list|show|failures|verify`):
+  `Run` (frozen `RunConfig`, one sealed dataset version, `identity_hash` vs `exec_hash`, lifecycle),
+  `CaseResult`, `EvaluatorResult` with named metrics, and `RunAttempt` (every external call, with
+  P0 evidence rules). Migration 4 (`runs_and_results`): tables, CHECKs and write-once triggers.
+  This records results; it does not execute anything yet.
+- New: failure taxonomy `FailureClass` (input / target / evaluator / infrastructure), `Failure`,
+  `EvalFailure`. A target failure is a case-result failure and its evaluator results can only be
+  `skipped`: it never becomes a score.
+- `evalkit.evidence` now holds the attempt-evidence capture shared by the single-record `Evaluator`
+  and run attempts (pure refactor, behaviour unchanged).
+
+### Dataset foundation
 
 - New: versioned, immutable, content-addressed datasets (`EvalKit.datasets`, `evalkit dataset ...`):
   atomic strict JSONL import with all-problems reporting, idempotent re-import, `name@version`
