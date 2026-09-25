@@ -227,6 +227,8 @@ CREATE TABLE case_results (
   started_at      TEXT,
   finished_at     TEXT,
   duration_ms     INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  -- processing order: a seeded hash of (seed, case_key), so a partial run is an unbiased sample
+  ord             INTEGER,
   UNIQUE (run_id, case_id),
   CHECK (
     (status = 'pending' AND output IS NULL AND retrieved_json IS NULL
@@ -242,7 +244,7 @@ CREATE TABLE case_results (
         AND retryable IS NOT NULL AND finished_at IS NOT NULL)
   )
 );
-CREATE INDEX idx_case_results_status ON case_results(run_id, status);
+CREATE INDEX idx_case_results_claim ON case_results(run_id, status, ord, id);
 CREATE INDEX idx_case_results_failures ON case_results(run_id, failure_class, failure_kind)
   WHERE status = 'failed';
 
@@ -391,7 +393,7 @@ BEGIN SELECT RAISE(ABORT, 'the run is not accepting this result (results need a 
 CREATE TRIGGER case_results_write_once BEFORE UPDATE ON case_results
 WHEN OLD.status <> 'pending' OR NEW.status = 'pending'
   OR NEW.id IS NOT OLD.id OR NEW.run_id IS NOT OLD.run_id OR NEW.case_id IS NOT OLD.case_id
-  OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_at IS NOT OLD.created_at OR NEW.ord IS NOT OLD.ord
   OR COALESCE((SELECT status FROM runs WHERE id = OLD.run_id), '') <> 'running'
 BEGIN SELECT RAISE(ABORT, 'case results are write-once, and only on a running run'); END;
 
@@ -462,6 +464,77 @@ BEGIN SELECT RAISE(ABORT, 'attempts are permanent records'); END;
 """
 
 
+# Analysis foundation: run summaries (immutable snapshots), run tags (baselines resolve by tag),
+# `reviews` generalized to grade a case result / one evaluator's verdict (the table is rebuilt: an
+# existing CHECK cannot be relaxed in place), and judge-check results.
+ANALYSIS_SQL = """
+CREATE TABLE run_summaries (
+  run_id          TEXT NOT NULL REFERENCES runs(id),
+  computed_at     TEXT NOT NULL,
+  evalkit_version TEXT NOT NULL,
+  summary_json    TEXT NOT NULL,
+  PRIMARY KEY (run_id, computed_at)
+) WITHOUT ROWID;
+CREATE TRIGGER run_summaries_no_update BEFORE UPDATE ON run_summaries
+BEGIN SELECT RAISE(ABORT, 'run summaries are snapshots'); END;
+CREATE TRIGGER run_summaries_no_delete BEFORE DELETE ON run_summaries
+BEGIN SELECT RAISE(ABORT, 'run summaries are snapshots'); END;
+
+CREATE TABLE run_tags (
+  run_id     TEXT NOT NULL REFERENCES runs(id),
+  tag        TEXT NOT NULL CHECK (length(tag) BETWEEN 1 AND 128),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, tag)
+) WITHOUT ROWID;
+CREATE INDEX idx_run_tags_tag ON run_tags(tag);
+
+CREATE TABLE reviews_new (
+  id             TEXT PRIMARY KEY,
+  evaluation_id  TEXT REFERENCES evaluations(id),
+  case_result_id TEXT REFERENCES case_results(id),
+  evaluator_key  TEXT,
+  sample         TEXT NOT NULL DEFAULT 'targeted' CHECK (sample IN ('random', 'targeted')),
+  reviewer       TEXT NOT NULL,
+  score          REAL CHECK (score BETWEEN 0 AND 1),
+  verdict        TEXT NOT NULL CHECK (verdict IN ('PASS', 'FAIL')),
+  comment        TEXT,
+  created_at     TEXT NOT NULL,
+  -- exactly one subject: a legacy evaluation or a run's case result
+  CHECK ((evaluation_id IS NULL) + (case_result_id IS NULL) = 1),
+  CHECK (evaluator_key IS NULL OR case_result_id IS NOT NULL)
+);
+INSERT INTO reviews_new (id, evaluation_id, reviewer, score, verdict, comment, created_at)
+  SELECT id, evaluation_id, reviewer, score, verdict, comment, created_at FROM reviews;
+DROP TABLE reviews;
+ALTER TABLE reviews_new RENAME TO reviews;
+CREATE INDEX idx_reviews_evaluation_id ON reviews(evaluation_id);
+CREATE INDEX idx_reviews_case_result ON reviews(case_result_id, evaluator_key);
+CREATE TRIGGER reviews_no_update BEFORE UPDATE ON reviews
+BEGIN SELECT RAISE(ABORT, 'reviews are append-only'); END;
+CREATE TRIGGER reviews_no_delete BEFORE DELETE ON reviews
+BEGIN SELECT RAISE(ABORT, 'reviews are append-only'); END;
+
+CREATE TABLE judge_checks (
+  id                  TEXT PRIMARY KEY,
+  evaluator_key       TEXT NOT NULL,
+  fixture_name        TEXT NOT NULL,
+  fixture_hash        TEXT NOT NULL CHECK (length(fixture_hash) = 64),
+  n                   INTEGER NOT NULL CHECK (n >= 1),
+  correct             INTEGER NOT NULL CHECK (correct BETWEEN 0 AND n),
+  adversarial_n       INTEGER NOT NULL CHECK (adversarial_n BETWEEN 0 AND n),
+  adversarial_correct INTEGER NOT NULL CHECK (adversarial_correct BETWEEN 0 AND adversarial_n),
+  failed              INTEGER NOT NULL CHECK (failed BETWEEN 0 AND n),
+  results_json        TEXT NOT NULL,
+  created_at          TEXT NOT NULL
+);
+CREATE INDEX idx_judge_checks_key ON judge_checks(evaluator_key, created_at);
+CREATE TRIGGER judge_checks_no_update BEFORE UPDATE ON judge_checks
+BEGIN SELECT RAISE(ABORT, 'judge checks are write-once'); END;
+CREATE TRIGGER judge_checks_no_delete BEFORE DELETE ON judge_checks
+BEGIN SELECT RAISE(ABORT, 'judge checks are permanent records'); END;
+"""
+
+
 def _backfill_rubric_versions(conn: sqlite3.Connection) -> None:
     """Register the rubric version -> content hash of every existing row (earliest first wins).
 
@@ -518,6 +591,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(2, "p0_hardening", P0_SQL, _backfill_rubric_versions),
     Migration(3, "dataset_foundation", DATASETS_SQL),
     Migration(4, "runs_and_results", RUNS_SQL),
+    Migration(5, "analysis_foundation", ANALYSIS_SQL),
 )
 
 _V1_EVALUATION_COLUMNS = frozenset(

@@ -33,6 +33,8 @@ from evalkit.runs import (
     RunConfig,
     RunCounts,
     RunVerifyReport,
+    Unit,
+    WriteItem,
 )
 
 _MAX_PROBLEMS = 100
@@ -284,17 +286,24 @@ class RunStoreMixin:
 
     # -- writing results ------------------------------------------------------------------
 
-    def plan_run(self, run_id: str) -> int:
+    def plan_run(self, run_id: str, seed: int = 0) -> int:
         with self._tx() as conn:
             row = self._run_row(run_id)
             if row["status"] not in ("created", "running"):
                 raise RunError(f"cannot plan a {row['status']} run; resume it first")
             cursor = conn.execute(
-                "INSERT INTO case_results (id, run_id, case_id, status, created_at) "
-                "SELECT lower(hex(randomblob(16))), ?, c.id, 'pending', ? FROM cases c "
+                "INSERT INTO case_results (id, run_id, case_id, status, created_at, ord) "
+                "SELECT lower(hex(randomblob(16))), ?, c.id, 'pending', ?, "
+                "evalkit_ord(?, c.case_key) FROM cases c "
                 "WHERE c.dataset_version_id = ? AND NOT EXISTS "
                 "(SELECT 1 FROM case_results r WHERE r.run_id = ? AND r.case_id = c.id)",
-                (run_id, datetime.now(UTC).isoformat(), row["dataset_version_id"], run_id),
+                (
+                    run_id,
+                    datetime.now(UTC).isoformat(),
+                    int(seed),
+                    row["dataset_version_id"],
+                    run_id,
+                ),
             )
             return cursor.rowcount
 
@@ -340,127 +349,227 @@ class RunStoreMixin:
         self, run_id: str, case_key: str, outcome: CaseOutcome, attempts: Sequence[RunAttempt]
     ) -> CaseResult:
         with self._tx() as conn:
-            run = self._run_row(run_id)
-            case = conn.execute(
-                "SELECT id FROM cases WHERE dataset_version_id = ? AND case_key = ?",
-                (run["dataset_version_id"], case_key),
-            ).fetchone()
-            if case is None:
-                raise RunError(
-                    f"case {case_key!r} is not part of run {run_id}'s dataset version "
-                    f"({run['dataset_name']}@{run['dataset_version_no']})"
-                )
-            existing = conn.execute(
-                "SELECT id, status FROM case_results WHERE run_id = ? AND case_id = ?",
-                (run_id, case["id"]),
-            ).fetchone()
-            if existing is not None and existing["status"] != "pending":
-                raise DuplicateResultError(f"case {case_key!r} already has a result in this run")
-            if run["status"] != "running":
-                raise RunError(f"run {run_id} is {run['status']}; results need a running run")
-            failure = outcome.failure
-            values = {
-                "status": "failed" if failure else "complete",
-                "output": outcome.output,
-                "retrieved_json": None
-                if outcome.retrieved is None
-                else json.dumps(outcome.retrieved),
-                "failure_class": failure and failure.failure_class.value,
-                "failure_kind": failure and failure.kind,
-                "failure_message": failure and failure.message,
-                "retryable": failure and int(failure.retryable),
-                "started_at": _iso(outcome.started_at),
-                "finished_at": _iso(outcome.finished_at),
-                "duration_ms": outcome.duration_ms,
-            }
-            if existing is None:
-                result_id = str(uuid.uuid4())
-                cols = {
-                    "id": result_id,
-                    "run_id": run_id,
-                    "case_id": case["id"],
-                    "created_at": datetime.now(UTC).isoformat(),
-                    **values,
-                }
-                conn.execute(
-                    f"INSERT INTO case_results ({', '.join(cols)}) "
-                    f"VALUES ({', '.join(f':{k}' for k in cols)})",
-                    cols,
-                )
-            else:
-                result_id = existing["id"]
-                conn.execute(
-                    f"UPDATE case_results SET {', '.join(f'{k} = :{k}' for k in values)} "
-                    "WHERE id = :id AND status = 'pending'",
-                    {**values, "id": result_id},
-                )
-            self._insert_attempts(conn, "case_result_id", result_id, attempts)
+            result_id = self._write_case_result(conn, run_id, case_key, outcome, attempts)
             return self._case_result(result_id)
+
+    def _write_case_result(
+        self,
+        conn: sqlite3.Connection,
+        run_id: str,
+        case_key: str,
+        outcome: CaseOutcome,
+        attempts: Sequence[RunAttempt],
+    ) -> str:
+        """Must be called inside `_tx`."""
+        run = self._run_row(run_id)
+        case = conn.execute(
+            "SELECT id FROM cases WHERE dataset_version_id = ? AND case_key = ?",
+            (run["dataset_version_id"], case_key),
+        ).fetchone()
+        if case is None:
+            raise RunError(
+                f"case {case_key!r} is not part of run {run_id}'s dataset version "
+                f"({run['dataset_name']}@{run['dataset_version_no']})"
+            )
+        existing = conn.execute(
+            "SELECT id, status FROM case_results WHERE run_id = ? AND case_id = ?",
+            (run_id, case["id"]),
+        ).fetchone()
+        if existing is not None and existing["status"] != "pending":
+            raise DuplicateResultError(f"case {case_key!r} already has a result in this run")
+        if run["status"] != "running":
+            raise RunError(f"run {run_id} is {run['status']}; results need a running run")
+        failure = outcome.failure
+        values = {
+            "status": "failed" if failure else "complete",
+            "output": outcome.output,
+            "retrieved_json": None if outcome.retrieved is None else json.dumps(outcome.retrieved),
+            "failure_class": failure and failure.failure_class.value,
+            "failure_kind": failure and failure.kind,
+            "failure_message": failure and failure.message,
+            "retryable": failure and int(failure.retryable),
+            "started_at": _iso(outcome.started_at),
+            "finished_at": _iso(outcome.finished_at),
+            "duration_ms": outcome.duration_ms,
+        }
+        if existing is None:
+            result_id = str(uuid.uuid4())
+            cols = {
+                "id": result_id,
+                "run_id": run_id,
+                "case_id": case["id"],
+                "created_at": datetime.now(UTC).isoformat(),
+                **values,
+            }
+            conn.execute(
+                f"INSERT INTO case_results ({', '.join(cols)}) "
+                f"VALUES ({', '.join(f':{k}' for k in cols)})",
+                cols,
+            )
+        else:
+            result_id = existing["id"]
+            conn.execute(
+                f"UPDATE case_results SET {', '.join(f'{k} = :{k}' for k in values)} "
+                "WHERE id = :id AND status = 'pending'",
+                {**values, "id": result_id},
+            )
+        self._insert_attempts(conn, "case_result_id", result_id, attempts)
+        return result_id
 
     def record_evaluator_result(
         self, case_result_id: str, outcome: EvaluatorOutcome, attempts: Sequence[RunAttempt]
     ) -> EvaluatorResult:
         with self._tx() as conn:
-            cr = conn.execute(
-                "SELECT r.run_id, r.status, x.status AS run_status FROM case_results r "
-                "JOIN runs x ON x.id = r.run_id WHERE r.id = ?",
-                (case_result_id,),
-            ).fetchone()
-            if cr is None:
-                raise RunError(f"case result {case_result_id!r} not found")
-            run_id = cr["run_id"]
-            if cr["run_status"] != "running":
-                raise RunError(f"run {run_id} is {cr['run_status']}; results need a running run")
-            if not conn.execute(
-                "SELECT 1 FROM run_evaluators WHERE run_id = ? AND evaluator_key = ?",
-                (run_id, outcome.evaluator_key),
-            ).fetchone():
-                raise RunError(
-                    f"evaluator {outcome.evaluator_key!r} is not one of run {run_id}'s evaluators"
-                )
-            allowed = {
-                "complete": ("ok", "not_applicable", "failed"),
-                "failed": ("skipped",),
-                "pending": (),
-            }[cr["status"]]
-            if outcome.status not in allowed:
-                hint = ", ".join(allowed) or "none: the target stage has no outcome yet"
-                raise RunError(
-                    f"a {outcome.status} evaluator result does not fit a {cr['status']} case "
-                    f"result (allowed: {hint})"
-                )
-            failure = outcome.failure
-            result_id = str(uuid.uuid4())
-            conn.execute(
-                "INSERT INTO evaluator_results (id, case_result_id, run_id, evaluator_key, status, "
-                "verdict, detail_json, failure_class, failure_kind, failure_message, retryable, "
-                "created_at, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    result_id,
-                    case_result_id,
-                    run_id,
-                    outcome.evaluator_key,
-                    outcome.status,
-                    outcome.verdict,
-                    json.dumps(outcome.detail, allow_nan=False),
-                    failure and failure.failure_class.value,
-                    failure and failure.kind,
-                    failure and failure.message,
-                    failure and int(failure.retryable),
-                    datetime.now(UTC).isoformat(),
-                    outcome.duration_ms,
-                ),
-            )
-            conn.executemany(
-                "INSERT INTO metrics (evaluator_result_id, run_id, evaluator_key, name, value) "
-                "VALUES (?,?,?,?,?)",
-                [
-                    (result_id, run_id, outcome.evaluator_key, name, value)
-                    for name, value in outcome.metrics.items()
-                ],
-            )
-            self._insert_attempts(conn, "evaluator_result_id", result_id, attempts)
+            result_id = self._write_evaluator_result(conn, case_result_id, outcome, attempts)
             return self._evaluator_results("e.id = ?", (result_id,))[0]
+
+    def _write_evaluator_result(
+        self,
+        conn: sqlite3.Connection,
+        case_result_id: str,
+        outcome: EvaluatorOutcome,
+        attempts: Sequence[RunAttempt],
+    ) -> str:
+        """Must be called inside `_tx`."""
+        cr = conn.execute(
+            "SELECT r.run_id, r.status, x.status AS run_status FROM case_results r "
+            "JOIN runs x ON x.id = r.run_id WHERE r.id = ?",
+            (case_result_id,),
+        ).fetchone()
+        if cr is None:
+            raise RunError(f"case result {case_result_id!r} not found")
+        run_id = cr["run_id"]
+        if cr["run_status"] != "running":
+            raise RunError(f"run {run_id} is {cr['run_status']}; results need a running run")
+        if not conn.execute(
+            "SELECT 1 FROM run_evaluators WHERE run_id = ? AND evaluator_key = ?",
+            (run_id, outcome.evaluator_key),
+        ).fetchone():
+            raise RunError(
+                f"evaluator {outcome.evaluator_key!r} is not one of run {run_id}'s evaluators"
+            )
+        allowed = {
+            "complete": ("ok", "not_applicable", "failed"),
+            "failed": ("skipped",),
+            "pending": (),
+        }[cr["status"]]
+        if outcome.status not in allowed:
+            hint = ", ".join(allowed) or "none: the target stage has no outcome yet"
+            raise RunError(
+                f"a {outcome.status} evaluator result does not fit a {cr['status']} case "
+                f"result (allowed: {hint})"
+            )
+        failure = outcome.failure
+        result_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO evaluator_results (id, case_result_id, run_id, evaluator_key, status, "
+            "verdict, detail_json, failure_class, failure_kind, failure_message, retryable, "
+            "created_at, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                result_id,
+                case_result_id,
+                run_id,
+                outcome.evaluator_key,
+                outcome.status,
+                outcome.verdict,
+                json.dumps(outcome.detail, allow_nan=False),
+                failure and failure.failure_class.value,
+                failure and failure.kind,
+                failure and failure.message,
+                failure and int(failure.retryable),
+                datetime.now(UTC).isoformat(),
+                outcome.duration_ms,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO metrics (evaluator_result_id, run_id, evaluator_key, name, value) "
+            "VALUES (?,?,?,?,?)",
+            [
+                (result_id, run_id, outcome.evaluator_key, name, value)
+                for name, value in outcome.metrics.items()
+            ],
+        )
+        self._insert_attempts(conn, "evaluator_result_id", result_id, attempts)
+        return result_id
+
+    def write_batch(self, run_id: str, items: Sequence[WriteItem]) -> None:
+        """Persist many results in ONE transaction (the single-writer batch of design 8.1/11.1):
+        all of them or none. An evaluator item finds its case result by case_key, so it may follow
+        its case item in the same batch."""
+        with self._tx() as conn:
+            for item in items:
+                if item.kind == "case":
+                    self._write_case_result(
+                        conn,
+                        run_id,
+                        item.case_key,
+                        item.outcome,
+                        item.attempts,  # type: ignore[arg-type]
+                    )
+                else:
+                    row = conn.execute(
+                        "SELECT r.id FROM case_results r JOIN cases c ON c.id = r.case_id "
+                        "JOIN runs x ON x.id = r.run_id "
+                        "AND c.dataset_version_id = x.dataset_version_id "
+                        "WHERE r.run_id = ? AND c.case_key = ?",
+                        (run_id, item.case_key),
+                    ).fetchone()
+                    if row is None:
+                        raise RunError(f"case {item.case_key!r} has no case result in run {run_id}")
+                    self._write_evaluator_result(
+                        conn,
+                        row["id"],
+                        item.outcome,
+                        item.attempts,  # type: ignore[arg-type]
+                    )
+
+    def pending_units(self, run_id: str, n_evaluators: int) -> list[Unit]:
+        """Complete case results still missing evaluator results (crash recovery)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT r.id, r.output, r.retrieved_json, c.case_key FROM case_results r "
+                "JOIN cases c ON c.id = r.case_id WHERE r.run_id = ? AND r.status = 'complete' "
+                "AND (SELECT COUNT(*) FROM evaluator_results e WHERE e.case_result_id = r.id) < ? "
+                "ORDER BY COALESCE(r.ord, 0), r.id",
+                (run_id, n_evaluators),
+            ).fetchall()
+        return [
+            Unit(
+                r["id"],
+                r["case_key"],
+                "complete",
+                r["output"],
+                None if r["retrieved_json"] is None else json.loads(r["retrieved_json"]),
+            )
+            for r in rows
+        ]
+
+    def next_pending(
+        self, run_id: str, after: tuple[int, str] | None, limit: int
+    ) -> list[tuple[int, Unit]]:
+        """Pending case results in processing order, keyset-paged after `(ord, id)`."""
+        where, params = "", []
+        if after is not None:
+            where, params = " AND (COALESCE(r.ord, 0), r.id) > (?, ?)", [after[0], after[1]]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT r.id, COALESCE(r.ord, 0) AS o, c.case_key FROM case_results r "
+                "JOIN cases c ON c.id = r.case_id "
+                f"WHERE r.run_id = ? AND r.status = 'pending'{where} "
+                "ORDER BY COALESCE(r.ord, 0), r.id LIMIT ?",
+                (run_id, *params, limit),
+            ).fetchall()
+        return [(r["o"], Unit(r["id"], r["case_key"], "pending")) for r in rows]
+
+    def done_evaluator_keys(self, case_result_id: str) -> set[str]:
+        with self._lock:
+            return {
+                r[0]
+                for r in self._conn.execute(
+                    "SELECT evaluator_key FROM evaluator_results WHERE case_result_id = ?",
+                    (case_result_id,),
+                )
+            }
 
     # -- reading results ------------------------------------------------------------------
 

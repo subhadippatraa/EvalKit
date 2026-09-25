@@ -16,6 +16,10 @@ evalkit = "evalkit.cli:main"
 bedrock-openai = [
     "openai>=1.50",
 ]
+# the `json_schema` evaluator; the core stays on pydantic + boto3 only
+jsonschema = [
+    "jsonschema>=4.20",
+]
 
 [dependency-groups]
 dev = [
@@ -23,6 +27,7 @@ dev = [
     "ruff>=0.6",
     "openai>=1.50",
     "hypothesis>=6.168.1",
+    "jsonschema>=4.26.0",
 ]
 
 [build-system]

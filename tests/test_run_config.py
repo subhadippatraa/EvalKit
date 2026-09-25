@@ -215,7 +215,9 @@ json_dicts = st.dictionaries(st.text(min_size=1, max_size=6), scalars, max_size=
 @settings(max_examples=100, deadline=None)
 @given(params=json_dicts, policy=json_dicts, perm=st.randoms())
 def test_property_identity_is_order_and_policy_independent(params, policy, perm):
-    evaluators = [spec("k", f"n{i}", **params, extra=i) for i in range(4)]
+    evaluators = [
+        EvaluatorSpec(kind="k", name=f"n{i}", params={**params, "extra": i}) for i in range(4)
+    ]
     shuffled = evaluators[:]
     perm.shuffle(shuffled)
     a = RunConfig(evaluators=evaluators)
@@ -227,7 +229,8 @@ def test_property_identity_is_order_and_policy_independent(params, policy, perm)
 @settings(max_examples=100, deadline=None)
 @given(a=json_dicts, b=json_dicts)
 def test_property_distinct_params_give_distinct_keys(a, b):
-    ka, kb = spec("k", "n", **a).key, spec("k", "n", **b).key
+    ka = EvaluatorSpec(kind="k", name="n", params=a).key
+    kb = EvaluatorSpec(kind="k", name="n", params=b).key
     # equal keys only for params that are equal as JSON (1 == 1.0 in Python, not in the hash)
     if ka == kb:
         assert EvaluatorSpec(kind="k", name="n", params=a).params == (

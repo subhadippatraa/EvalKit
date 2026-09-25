@@ -99,7 +99,7 @@ _STOP_REASON_STATUSES = frozenset({"partial", "failed", "cancelled"})  # these s
 
 _KIND_RE = r"^[a-z][a-z0-9_]{0,31}$"
 _NAME_RE = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"  # no ':' -- it separates the parts of a key
-_METRIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$")  # score, recall@5, criterion.x
+_METRIC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$")  # score, recall@5, criterion.x
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_LABEL = 128
 
@@ -328,7 +328,7 @@ class RunAttempt(BaseModel):
             fields.setdefault("provider", failure.provider)
             fields.setdefault("http_status", failure.http_status)
             fields.setdefault("request_id", failure.request_id)
-            fields.setdefault("error_type", type(failure).__name__)
+            fields.setdefault("error_type", failure.exc_type or type(failure).__name__)
             failure = failure.failure
         text, sha, truncated = capture_evidence(evidence, keep_text=True)
         return cls(
@@ -566,6 +566,29 @@ class RunCounts:
 
 
 @dataclass(frozen=True)
+class WriteItem:
+    """One result to persist in a batch: a case result (`key` = case_key) or an evaluator result
+    (`key` = case_key of the case result it belongs to)."""
+
+    kind: Literal["case", "evaluator"]
+    case_key: str
+    outcome: CaseOutcome | EvaluatorOutcome
+    attempts: Sequence[RunAttempt] = ()
+
+
+@dataclass(frozen=True)
+class Unit:
+    """A unit of work the executor still owes: a pending case result, or a complete one that is
+    missing evaluator results (e.g. after a crash)."""
+
+    result_id: str
+    case_key: str
+    status: Literal["pending", "complete"]
+    output: str | None = None
+    retrieved: list[str] | None = None
+
+
+@dataclass(frozen=True)
 class FailureRecord:
     scope: Literal["case", "evaluator"]
     result_id: str
@@ -593,7 +616,7 @@ class _RunStore(Protocol):  # what RunService needs; SQLiteStore implements it v
     def get_run(self, run_id: str) -> Run: ...
     def list_runs(self, dataset_version_id: str | None, status: str | None, limit: int): ...
     def transition_run(self, run_id: str, status: str, stop_reason: str | None) -> Run: ...
-    def plan_run(self, run_id: str) -> int: ...
+    def plan_run(self, run_id: str, seed: int = 0) -> int: ...
     def record_case_result(self, run_id, case_key, outcome, attempts) -> CaseResult: ...
     def record_evaluator_result(self, case_result_id, outcome, attempts) -> EvaluatorResult: ...
     def get_case_result(self, run_id: str, case_key: str) -> CaseResult | None: ...
@@ -723,11 +746,13 @@ class RunService:
 
     # -- recording results ------------------------------------------------------------------
 
-    def plan(self, run_id: str) -> int:
+    def plan(self, run_id: str, *, seed: int = 0) -> int:
         """Create a `pending` case result for every case of the run's dataset version that has
         none yet; returns how many were created (0 when already planned). This is what makes
-        "every case accounted for" checkable: a case is pending, done, failed, or has no row."""
-        return self.store.plan_run(run_id)
+        "every case accounted for" checkable: a case is pending, done, failed, or has no row.
+        Each row gets a processing order, a hash of (seed, case_key): a run that stops early has
+        processed an unbiased sample of the dataset, not a prefix of the file."""
+        return self.store.plan_run(run_id, seed)
 
     def record_case_result(
         self,

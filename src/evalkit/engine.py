@@ -1,0 +1,895 @@
+"""Run execution (docs/TARGET-ARCHITECTURE.md §4, §8): the smallest correct executor.
+
+    DatasetVersion -> Run -> [per case] Target -> CaseResult -> Evaluator(s) -> EvaluatorResult
+
+* One process. A bounded window of units is in flight on a thread pool (`window`, default
+  2 x concurrency); results go through ONE writer thread that commits batches, so a slow database
+  blocks producers (backpressure) instead of growing memory. No asyncio, no broker.
+* Units are processed in seeded-hash order, so a run that stops early has processed an unbiased
+  sample of the dataset, not a prefix of the file.
+* A unit is a case: its target stage, then each of the run's evaluators, independently. A failure
+  is classified where it happens and recorded on the result that failed: a target failure is a
+  case-result failure (its evaluators are `skipped`, never scored), an evaluator failure is that
+  evaluator's alone. Nothing becomes a synthetic zero.
+* Stopping. Cancellation and budget stop *dispatch*; in-flight units finish (a request in flight
+  is never aborted). A systemic failure (auth, bad model id, quota) stops the run as `failed`; a
+  tripped breaker or exhausted budget as `partial`. Everything completed is kept.
+* Resume. `execute` on a partial / cancelled / failed run finishes what is left: pending case
+  results, and complete ones missing evaluator results (crash recovery). Terminal results are
+  never redone (they are write-once). **Not in P1:** retrying failed results (`--retry-failed`),
+  leases and multi-process workers, the response cache, USD pricing budgets.
+* Storage failures never lose paid results: on a persistent write failure the unwritten results
+  are spilled to `<db>.spill/<run_id>.jsonl`, the run stops `partial(infrastructure.storage)`,
+  and the next `execute` replays the spill first.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import sqlite3
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import ValidationError
+
+from evalkit.calls import (
+    Budget,
+    CallRunner,
+    CancelToken,
+    RateLimiter,
+    RetryPolicy,
+    RunGuard,
+    SpendTotals,
+)
+from evalkit.errors import ConfigError, DuplicateResultError, RunError
+from evalkit.evaluators import (
+    EVALUATOR_KINDS,
+    CaseEvaluator,
+    EvalContext,
+    EvalInput,
+    NotApplicable,
+    build,
+    resolve,
+)
+from evalkit.failures import EvalFailure, Failure, FailureClass
+from evalkit.llm import LLMClient
+from evalkit.models import format_validation_error
+from evalkit.runs import (
+    CaseOutcome,
+    EvaluatorOutcome,
+    EvaluatorSpec,
+    Run,
+    RunAttempt,
+    RunConfig,
+    RunCounts,
+    Unit,
+    WriteItem,
+)
+from evalkit.targets import (
+    CallableTarget,
+    ModelTarget,
+    PrecomputedTarget,
+    ReuseTarget,
+    Target,
+    TargetInput,
+    TargetOutput,
+    spec_of,
+    view,
+)
+
+if TYPE_CHECKING:
+    from evalkit.kit import EvalKit
+
+log = logging.getLogger("evalkit.engine")
+
+_PAGE = 256
+
+
+# ---- policy ---------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecPolicy:
+    """How a run executes (`RunConfig.policy`; hashed into `exec_hash`, never into identity)."""
+
+    concurrency: int = 4
+    window: int | None = None  # units in flight; default 2 x concurrency
+    batch_size: int = 100  # results per writer transaction
+    batch_ms: int = 200  # ...or this long, whichever first
+    seed: int = 0  # processing order
+    on_missing: Literal["abort", "not_applicable"] = "abort"
+    breaker_threshold: int = 10
+    max_calls_per_s: float | None = None
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
+    budget: Budget = field(default_factory=Budget)
+
+    def __post_init__(self) -> None:
+        def check(name: str, lo: int, hi: int) -> None:
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise ValueError(f"{name} must be an integer in {lo}..{hi}")
+
+        check("concurrency", 1, 64)
+        check("batch_size", 1, 10_000)
+        check("batch_ms", 1, 60_000)
+        check("breaker_threshold", 1, 10_000)
+        if self.window is not None:
+            check("window", self.concurrency, 10_000)
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise ValueError("seed must be an integer")
+        if self.on_missing not in ("abort", "not_applicable"):
+            raise ValueError("on_missing must be 'abort' or 'not_applicable'")
+        if self.max_calls_per_s is not None and not 0 < self.max_calls_per_s < float("inf"):
+            raise ValueError("max_calls_per_s must be positive and finite")
+
+    @property
+    def in_flight(self) -> int:
+        return self.window if self.window is not None else 2 * self.concurrency
+
+    @classmethod
+    def from_mapping(cls, m: Mapping[str, Any]) -> ExecPolicy:
+        m = dict(m)
+        unknown = set(m) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown execution setting(s): {sorted(unknown)}")
+        if "retry" in m:
+            m["retry"] = RetryPolicy.from_mapping(m["retry"])
+        if "budget" in m:
+            m["budget"] = Budget.from_mapping(m["budget"])
+        return cls(**m)
+
+
+# ---- preflight ------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreflightIssue:
+    level: Literal["error", "warning"]
+    code: str
+    message: str
+    count: int = 0
+    examples: tuple[str, ...] = ()
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "level": self.level,
+            "code": self.code,
+            "message": self.message,
+            "count": self.count,
+            "examples": list(self.examples),
+        }
+
+
+@dataclass(frozen=True)
+class PreflightReport:
+    """What was known before anything was spent (design 4.4). Stored on the run."""
+
+    dataset: str
+    cases: int
+    issues: tuple[PreflightIssue, ...] = ()
+    estimate: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def errors(self) -> list[PreflightIssue]:
+        return [i for i in self.issues if i.level == "error"]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "dataset": self.dataset,
+            "cases": self.cases,
+            "ok": self.ok,
+            "issues": [i.to_json() for i in self.issues],
+            "estimate": self.estimate,
+        }
+
+
+class PreflightError(RunError):
+    """A run was refused before creation because preflight found errors."""
+
+    def __init__(self, report: PreflightReport):
+        lines = "; ".join(f"{i.code}: {i.message}" for i in report.errors[:5])
+        super().__init__(f"preflight failed: {lines}")
+        self.report = report
+
+
+@dataclass
+class ExecutionReport:
+    run: Run
+    counts: RunCounts
+    stop_reason: str | None
+    units: int  # units processed by this call
+    elapsed_s: float
+    spend: SpendTotals
+    spilled: int = 0
+    worker_errors: int = 0
+
+    @property
+    def status(self) -> str:
+        return self.run.status
+
+    @property
+    def units_per_s(self) -> float:
+        return self.units / self.elapsed_s if self.elapsed_s > 0 else 0.0
+
+
+# ---- the writer -----------------------------------------------------------------------------
+
+_SENTINEL: Any = object()
+
+
+def _item_line(item: WriteItem) -> str:
+    return json.dumps(
+        {
+            "kind": item.kind,
+            "case_key": item.case_key,
+            "outcome": item.outcome.model_dump_json(),
+            "attempts": [a.model_dump_json() for a in item.attempts],
+        }
+    )
+
+
+def _line_item(line: str) -> WriteItem:
+    d = json.loads(line)
+    model = CaseOutcome if d["kind"] == "case" else EvaluatorOutcome
+    return WriteItem(
+        d["kind"],
+        d["case_key"],
+        model.model_validate_json(d["outcome"]),
+        [RunAttempt.model_validate_json(a) for a in d["attempts"]],
+    )
+
+
+class ResultWriter:
+    """The single writer: batches results into one transaction each (design 8.1/11.1)."""
+
+    def __init__(
+        self,
+        store: Any,
+        run_id: str,
+        *,
+        batch_size: int,
+        batch_ms: int,
+        depth: int,
+        retries: int = 3,
+    ):
+        self._store, self._run_id = store, run_id
+        self._batch_size, self._batch_s, self._retries = batch_size, batch_ms / 1000, retries
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(16, depth))
+        self._thread = threading.Thread(target=self._loop, name="evalkit-writer", daemon=True)
+        self.failed: BaseException | None = None
+        self.written = 0
+        self.duplicates = 0
+        self.spilled = 0
+        self.spilled_items: list[WriteItem] = []  # in-memory stores have no spill directory
+        self._closing = threading.Event()
+        self._thread.start()
+
+    def put(self, item: WriteItem) -> bool:
+        """Queue a result (blocks when the writer is behind: backpressure). False once the
+        writer has given up; the caller then knows its result was NOT queued."""
+        while self.failed is None:
+            try:
+                self._queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        self._spill([item])
+        return False
+
+    def close(self) -> None:
+        """Flush what is queued and stop the writer thread."""
+        self._closing.set()
+        try:
+            self._queue.put_nowait(_SENTINEL)
+        except queue.Full:
+            pass  # the loop also stops on its own once closing is set and the queue is empty
+        self._thread.join()
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                first = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._closing.is_set():
+                    return
+                continue
+            if first is _SENTINEL:
+                return
+            batch = [first]
+            deadline = time.monotonic() + self._batch_s
+            stop = False
+            while len(batch) < self._batch_size:
+                try:
+                    item = self._queue.get(timeout=max(0.0, deadline - time.monotonic()))
+                except queue.Empty:
+                    break
+                if item is _SENTINEL:
+                    stop = True
+                    break
+                batch.append(item)
+            self._flush(batch)
+            if stop:
+                return
+
+    def _flush(self, batch: list[WriteItem]) -> None:
+        if self.failed is not None:
+            self._spill(batch)
+            return
+        delay = 0.05
+        for attempt in range(self._retries + 1):
+            try:
+                self._store.write_batch(self._run_id, batch)
+                self.written += len(batch)
+                return
+            except sqlite3.OperationalError as e:  # locked / busy / disk I/O: transient or fatal
+                if attempt == self._retries:
+                    self._fail(e, batch)
+                    return
+                time.sleep(delay)
+                delay *= 2
+            except (RunError, sqlite3.Error):
+                self._one_by_one(batch)  # one bad item must not lose the others
+                return
+
+    def _one_by_one(self, batch: list[WriteItem]) -> None:
+        for i, item in enumerate(batch):
+            try:
+                self._store.write_batch(self._run_id, [item])
+                self.written += 1
+            except DuplicateResultError:
+                self.duplicates += 1  # already stored (e.g. by a crashed earlier attempt)
+            except (RunError, sqlite3.Error) as e:
+                self._fail(e, batch[i:])
+                return
+
+    def _fail(self, error: BaseException, items: list[WriteItem]) -> None:
+        log.error("result storage failed (%s); spilling %d result(s)", error, len(items))
+        self.failed = error
+        self._spill(items)
+        self._drain()
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is not _SENTINEL:
+                self._spill([item])
+
+    def _spill(self, items: list[WriteItem]) -> None:
+        directory = getattr(self._store, "spill_dir", None)
+        self.spilled += len(items)
+        if directory is None:
+            self.spilled_items.extend(items)
+            return
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = directory / f"{self._run_id}.jsonl"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            for item in items:
+                f.write(_item_line(item) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+# ---- the controller -------------------------------------------------------------------------
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _internal(stage: str, e: BaseException) -> Failure:
+    return Failure(
+        failure_class=FailureClass.INFRA,
+        kind="internal_error",
+        message=f"unexpected {type(e).__name__} in {stage}: {e}",
+    )
+
+
+class RunController:
+    """Creates (with preflight) and executes runs. Obtain one via `EvalKit.controller`."""
+
+    def __init__(self, kit: EvalKit):
+        self.kit = kit
+        self.store = kit.store
+        self.runs = kit.runs
+        self.datasets = kit.datasets
+        self.limits = kit.limits
+
+    # -- planning and preflight -------------------------------------------------------------
+
+    def preflight(
+        self,
+        dataset_ref: str,
+        target: Target,
+        evaluators: Sequence[EvaluatorSpec],
+        policy: Mapping[str, Any] | None = None,
+    ) -> PreflightReport:
+        version = self.datasets.resolve(dataset_ref)
+        issues: list[PreflightIssue] = []
+
+        def error(code: str, message: str, count: int = 0, examples: Sequence[str] = ()) -> None:
+            issues.append(PreflightIssue("error", code, message, count, tuple(examples)))
+
+        def warn(code: str, message: str, count: int = 0, examples: Sequence[str] = ()) -> None:
+            issues.append(PreflightIssue("warning", code, message, count, tuple(examples)))
+
+        try:
+            ExecPolicy.from_mapping(policy or {})
+        except (ValueError, TypeError) as e:
+            error("bad_config", f"invalid execution policy: {e}")
+        specs: list[EvaluatorSpec] = []
+        for spec in evaluators:
+            try:
+                specs.append(resolve(spec))
+            except ConfigError as e:
+                error("bad_config", f"evaluator {spec.name!r}: {e}")
+
+        if isinstance(target, ReuseTarget):
+            self._check_reuse(target, version.id, error)
+        if isinstance(target, CallableTarget) and not target.pinned:
+            warn(
+                "unpinned_target",
+                "the callable target declares no fingerprint: two runs of different code look "
+                "identical (pass fingerprint=... to pin it)",
+            )
+        if isinstance(target, ModelTarget):
+            self._check_contamination(target, version.id, warn)
+
+        # per-evaluator requirements, one streaming pass over the cases
+        need: dict[str, frozenset[str]] = {s.key: EVALUATOR_KINDS[s.kind].requires for s in specs}
+        static_retrieved = target.kind == "precomputed"
+        missing: dict[tuple[str, str], list[str]] = {}
+        no_output: list[str] = []
+        for case in self.datasets.cases(dataset_ref):
+            if target.kind == "precomputed" and case.output is None:
+                no_output.append(case.case_key)
+            for spec in specs:
+                for f in need[spec.key]:
+                    if f == "retrieved" and not static_retrieved:
+                        continue  # the target produces it
+                    if getattr(case, f) is None:
+                        missing.setdefault((spec.name, f), []).append(case.case_key)
+        if no_output:
+            error(
+                "missing_field",
+                "the precomputed target needs every case to carry an `output`",
+                len(no_output),
+                no_output[:5],
+            )
+        on_missing = (policy or {}).get("on_missing", "abort")
+        for (name, f), keys in sorted(missing.items()):
+            message = f"evaluator {name!r} needs `{f}`, missing in {len(keys)} case(s)"
+            if on_missing == "abort":
+                error("missing_field", message, len(keys), keys[:5])
+            else:
+                warn(
+                    "missing_field", message + " (recorded as not_applicable)", len(keys), keys[:5]
+                )
+        for finding in self.datasets.lint(dataset_ref):
+            warn(f"lint.{finding.code}", finding.message, finding.count, finding.examples)
+        judges = sum(1 for s in specs if s.kind == "llm_judge")
+        calls = {
+            "target_calls": version.case_count if target.kind in ("callable", "model") else 0,
+            "judge_calls": version.case_count * judges,
+        }
+        return PreflightReport(version.ref, version.case_count, tuple(issues), calls)
+
+    def _check_reuse(self, target: ReuseTarget, version_id: str, error: Callable[..., None]):
+        try:
+            source = self.runs.get(target.source_run_id)
+        except RunError as e:
+            error("bad_config", f"source run: {e}")
+            return
+        if source.dataset_version_id != version_id:
+            error(
+                "bad_config",
+                f"source run {source.id} used {source.dataset_ref}, not this run's dataset version",
+            )
+            return
+        counts = self.runs.counts(source.id)
+        if counts.pending or counts.missing:
+            error(
+                "bad_config",
+                f"source run {source.id} is not finished ({counts.pending} pending, "
+                f"{counts.missing} without a result); its outputs cannot be reused yet",
+                counts.pending + counts.missing,
+            )
+
+    def _check_contamination(self, target: ModelTarget, version_id: str, warn: Callable[..., None]):
+        """A prompt template must not contain any case's prompt or reference verbatim (few-shot
+        leakage from the evaluation set)."""
+        hits = []
+        for case in self.datasets.store.iter_cases(version_id):
+            for text in (case.prompt, case.reference):
+                if text and len(text) >= 20 and text in target.template:
+                    hits.append(case.case_key)
+                    break
+        if hits:
+            warn(
+                "contamination",
+                "the model target's template contains evaluation-set text verbatim",
+                len(hits),
+                hits[:5],
+            )
+
+    # -- creation ---------------------------------------------------------------------------
+
+    def create(
+        self,
+        dataset_ref: str,
+        *,
+        target: Target,
+        evaluators: Sequence[EvaluatorSpec],
+        policy: Mapping[str, Any] | None = None,
+        name: str | None = None,
+        idempotency_key: str | None = None,
+        environment: Mapping[str, Any] | None = None,
+    ) -> Run:
+        """Preflight, freeze the run (resolved evaluator specs, the target's identity, the
+        policy) and plan its case results. Refuses with `PreflightError` before anything is
+        created if preflight found errors."""
+        report = self.preflight(dataset_ref, target, evaluators, policy)
+        if not report.ok:
+            raise PreflightError(report)
+        resolved = [resolve(s) for s in evaluators]
+        config = RunConfig(target=spec_of(target), evaluators=resolved, policy=dict(policy or {}))
+        env = dict(environment or {}) | {"preflight": report.to_json()}
+        run = self.runs.create(
+            dataset_ref, config, name=name, idempotency_key=idempotency_key, environment=env
+        )
+        self.runs.plan(run.id, seed=ExecPolicy.from_mapping(config.policy).seed)
+        return run
+
+    # -- execution --------------------------------------------------------------------------
+
+    def _target_for(self, run: Run, supplied: Target | None) -> Target:
+        spec = run.config.target
+        if supplied is not None:
+            if spec_of(supplied) != spec:
+                raise RunError(
+                    "the supplied target does not match the run's frozen target "
+                    f"(run: {spec.kind} {spec.identity}; supplied: {supplied.kind} "
+                    f"{supplied.identity})"
+                )
+            return supplied
+        if spec.kind == "precomputed":
+            return PrecomputedTarget()
+        if spec.kind == "reuse":
+            return ReuseTarget(spec.identity["source_run_id"])
+        raise RunError(f"a {spec.kind} target must be supplied to execute (it cannot be persisted)")
+
+    def replay_spill(self, run_id: str) -> int:
+        """Write results a failed earlier execution spilled to disk; returns how many. The file is
+        removed only after every line is safely stored."""
+        directory = getattr(self.store, "spill_dir", None)
+        path = None if directory is None else directory / f"{run_id}.jsonl"
+        if path is None or not path.is_file():
+            return 0
+        items: list[WriteItem] = []
+        with open(path, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                if line.strip():
+                    try:
+                        items.append(_line_item(line))
+                    except (ValueError, KeyError, ValidationError) as e:
+                        raise RunError(f"{path}:{n} is not a valid spilled result: {e}") from e
+        # spill order across threads is not result order: case results always go first
+        items.sort(key=lambda item: item.kind != "case")
+        stored = 0
+        for item in items:
+            try:
+                self.store.write_batch(run_id, [item])
+                stored += 1
+            except DuplicateResultError:
+                stored += 1  # already there
+        path.unlink()
+        return stored
+
+    def execute(
+        self,
+        run_id: str,
+        *,
+        target: Target | None = None,
+        clients: Sequence[LLMClient] = (),
+        token: CancelToken | None = None,
+        on_progress: Callable[[int], None] | None = None,
+        overrides: Mapping[str, Any] | None = None,
+    ) -> ExecutionReport:
+        """Execute (or resume) a run and return what happened. See the module docstring.
+
+        `overrides` adjusts execution settings for this call only (e.g. a raised budget to resume
+        a run that stopped on it); they are not persisted and never affect the run's identity."""
+        started = time.monotonic()
+        run = self.runs.get(run_id)
+        if run.status == "succeeded":
+            raise RunError(f"run {run_id} already succeeded")
+        try:
+            policy = ExecPolicy.from_mapping({**run.config.policy, **(overrides or {})})
+        except (ValueError, TypeError) as e:
+            raise RunError(f"run {run_id} has an invalid execution policy: {e}") from e
+        evaluators = [build(spec, EvalContext(tuple(clients))) for spec in run.config.evaluators]
+        tgt = self._target_for(run, target)  # config problems surface before any state change
+
+        if run.status != "running":
+            run = self.runs.start(run_id)
+        self.replay_spill(run_id)
+        self.runs.plan(run_id, seed=policy.seed)
+
+        token = token or CancelToken()
+        guard = RunGuard(policy.budget, policy.breaker_threshold)
+        limiter = RateLimiter(policy.max_calls_per_s) if policy.max_calls_per_s else None
+        runner = CallRunner(policy.retry, token=token, guard=guard, limiter=limiter)
+        writer = ResultWriter(
+            self.store,
+            run_id,
+            batch_size=policy.batch_size,
+            batch_ms=policy.batch_ms,
+            depth=policy.in_flight * 8,
+        )
+        ctx = _Exec(run, policy, tgt, evaluators, runner, writer, self.store, self.limits)
+
+        processed = 0
+        worker_errors = 0
+        in_flight: set[Future[None]] = set()
+
+        def reap(done: set[Future[None]]) -> None:
+            nonlocal processed, worker_errors
+            for f in done:
+                in_flight.discard(f)
+                processed += 1
+                if f.exception() is not None:  # _process handles its own errors; this is a bug
+                    worker_errors += 1
+                    log.error("unit crashed: %r", f.exception())
+                if on_progress is not None:
+                    on_progress(processed)
+
+        def stop() -> tuple[str, str] | None:
+            if guard.abort is not None and guard.abort[0] == "failed":
+                return guard.abort
+            if token.cancelled:
+                return "cancelled", token.reason or "cancelled"
+            if guard.abort is not None:
+                return guard.abort
+            if writer.failed is not None:
+                return "partial", "infrastructure.storage"
+            if worker_errors:
+                return "partial", "infrastructure.internal_error"
+            if (reason := guard.budget_stop()) is not None:
+                return "partial", reason
+            return None
+
+        halted: tuple[str, str] | None = None
+        with ThreadPoolExecutor(
+            max_workers=policy.concurrency, thread_name_prefix="evalkit"
+        ) as pool:
+            for unit in self._units(run_id, len(evaluators)):
+                while len(in_flight) >= policy.in_flight:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    reap(done)
+                if (halted := stop()) is not None:
+                    break
+                in_flight.add(pool.submit(ctx.process, unit))
+            if in_flight:
+                done, _ = wait(in_flight)
+                reap(done)
+        writer.close()
+        halted = stop() or halted
+
+        counts = self.runs.counts(run_id)
+        complete_or_failed = counts.complete + counts.failed
+        finished = (
+            halted is None
+            and counts.pending == 0
+            and counts.missing == 0
+            and all(
+                sum(counts.evaluator_results.get(spec.key, {}).values()) == complete_or_failed
+                for spec in run.config.evaluators
+            )
+        )
+        if finished:
+            final = self.runs.transition(run_id, "succeeded")
+            reason = None
+        else:
+            status, reason = halted or ("partial", "incomplete")
+            final = self.runs.transition(run_id, status, stop_reason=reason)
+        self.kit.snapshot(final.id)
+        return ExecutionReport(
+            run=final,
+            counts=self.runs.counts(run_id),
+            stop_reason=reason,
+            units=processed,
+            elapsed_s=time.monotonic() - started,
+            spend=guard.usage,
+            spilled=writer.spilled,
+            worker_errors=worker_errors,
+        )
+
+    def _units(self, run_id: str, n_evaluators: int) -> Iterator[Unit]:
+        """Units still owed: complete results missing evaluator results first (crash recovery,
+        enumerated up front), then pending ones in processing order, keyset-paged."""
+        yield from self.store.pending_units(run_id, n_evaluators)
+        after: tuple[int, str] | None = None
+        while True:
+            page = self.store.next_pending(run_id, after, _PAGE)
+            for order, unit in page:
+                after = (order, unit.result_id)
+                yield unit
+            if len(page) < _PAGE:
+                return
+
+
+class _Exec:
+    """The per-run state shared by worker threads; `process` handles one unit."""
+
+    def __init__(self, run, policy, target, evaluators, runner, writer, store, limits):
+        self.run, self.policy, self.target = run, policy, target
+        self.evaluators: list[CaseEvaluator] = evaluators
+        self.runner, self.writer, self.store, self.limits = runner, writer, store, limits
+
+    def process(self, unit: Unit) -> None:
+        case = self.store.get_case(self.run.dataset_version_id, unit.case_key)
+        if case is None:  # cannot happen: units come from this dataset version
+            raise RunError(f"case {unit.case_key!r} vanished")
+        done = (
+            self.store.done_evaluator_keys(unit.result_id) if unit.status == "complete" else set()
+        )
+        if unit.status == "pending":
+            outcome, attempts = self._target_stage(case)
+            if not self.writer.put(WriteItem("case", unit.case_key, outcome, attempts)):
+                return
+            output, retrieved, failed = (
+                outcome.output,
+                outcome.retrieved,
+                outcome.failure is not None,
+            )
+        else:
+            output, retrieved, failed = unit.output, unit.retrieved, False
+        for ev in self.evaluators:
+            if ev.key in done:
+                continue
+            if failed:
+                eo = EvaluatorOutcome(
+                    evaluator_key=ev.key, status="skipped", detail={"reason": "target failed"}
+                )
+                attempts = []
+            else:
+                einp = EvalInput(
+                    case.case_key, case.prompt, output or "", case.reference, case.context,
+                    case.relevance, retrieved,
+                )  # fmt: skip
+                eo, attempts = self._evaluate(ev, einp)
+            if not self.writer.put(WriteItem("evaluator", unit.case_key, eo, attempts)):
+                return
+
+    # -- target stage -----------------------------------------------------------------------
+
+    def _target_input(self, case: Any) -> TargetInput:
+        t = self.target
+        if t.kind == "precomputed":
+            return view(case, provide_output=True)
+        if t.kind == "reuse":
+            src = self.store.get_case_result(t.source_run_id, case.case_key)  # type: ignore[attr-defined]
+            base = view(case)
+            if src is None or src.status == "pending":
+                return base
+            if src.failure is not None:
+                return TargetInput(base.case_key, base.prompt, base.context, None, src.failure)
+            return TargetInput(
+                base.case_key,
+                base.prompt,
+                base.context,
+                TargetOutput(src.output or "", src.retrieved),
+            )
+        return view(case)
+
+    def _target_stage(self, case: Any) -> tuple[CaseOutcome, list[RunAttempt]]:
+        calls = self.runner.unit()
+        started, t0 = _now(), time.monotonic()
+
+        def timing() -> dict[str, Any]:
+            return {
+                "started_at": started,
+                "finished_at": _now(),
+                "duration_ms": round((time.monotonic() - t0) * 1000),
+            }
+
+        try:
+            out = self.target.generate(self._target_input(case), calls)
+            limit = self.limits.max_field_bytes
+            if len(out.output.encode("utf-8", "replace")) > limit:
+                raise EvalFailure(
+                    FailureClass.TARGET,
+                    "contract_violation",
+                    f"the target's output is larger than {limit} bytes",
+                )
+            return CaseOutcome.complete(
+                out.output, retrieved=out.retrieved, **timing()
+            ), calls.attempts
+        except EvalFailure as f:
+            return CaseOutcome.fail(f.failure, **timing()), calls.attempts
+        except Exception as e:  # a bug in EvalKit, not the target's fault
+            log.exception("unexpected error in the target stage")
+            return CaseOutcome.fail(_internal("the target stage", e), **timing()), calls.attempts
+
+    # -- evaluator stage --------------------------------------------------------------------
+
+    def _evaluate(
+        self, ev: CaseEvaluator, einp: EvalInput
+    ) -> tuple[EvaluatorOutcome, list[RunAttempt]]:
+        calls = self.runner.unit()
+        t0 = time.monotonic()
+
+        def duration() -> int:
+            return round((time.monotonic() - t0) * 1000)
+
+        def failed(f: Failure) -> EvaluatorOutcome:
+            return EvaluatorOutcome(
+                evaluator_key=ev.key, status="failed", failure=f, duration_ms=duration()
+            )
+
+        missing = sorted(f for f in ev.requires if getattr(einp, f) is None)
+        if missing:
+            reason = f"the case has no {', '.join(missing)}"
+            if self.policy.on_missing == "not_applicable":
+                return EvaluatorOutcome(
+                    evaluator_key=ev.key, status="not_applicable", detail={"reason": reason}
+                ), []
+            return failed(
+                Failure(failure_class=FailureClass.INPUT, kind="missing_field", message=reason)
+            ), []
+        try:
+            eo = ev.evaluate(einp, calls)
+            outcome = EvaluatorOutcome(
+                evaluator_key=ev.key,
+                status="ok",
+                verdict=eo.verdict,  # type: ignore[arg-type]
+                metrics=eo.metrics,
+                detail=eo.detail,
+                duration_ms=duration(),
+            )
+            if (
+                len(json.dumps(outcome.detail, ensure_ascii=False).encode())
+                > self.limits.max_field_bytes
+            ):
+                raise EvalFailure(
+                    FailureClass.EVALUATOR, "internal_error", "the evaluator's detail is too large"
+                )
+            return outcome, calls.attempts
+        except NotApplicable as na:
+            return EvaluatorOutcome(
+                evaluator_key=ev.key,
+                status="not_applicable",
+                detail={"reason": na.reason},
+                duration_ms=duration(),
+            ), calls.attempts
+        except EvalFailure as f:
+            return failed(f.failure), calls.attempts
+        except ValidationError as e:  # e.g. a non-finite metric: an evaluator bug, never a score
+            msg = f"the evaluator produced an invalid outcome: {format_validation_error(e)}"
+            return failed(
+                Failure(failure_class=FailureClass.EVALUATOR, kind="internal_error", message=msg)
+            ), calls.attempts
+        except Exception as e:
+            log.exception("unexpected error in evaluator %s", ev.key)
+            return failed(
+                Failure(
+                    failure_class=FailureClass.EVALUATOR,
+                    kind="internal_error",
+                    message=f"{type(e).__name__}: {e}",
+                )
+            ), calls.attempts

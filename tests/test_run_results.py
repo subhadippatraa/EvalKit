@@ -337,7 +337,7 @@ def test_metric_values_must_be_finite_real_numbers(value):
         EvaluatorOutcome(evaluator_key="k", status="ok", metrics={"score": value})
 
 
-@pytest.mark.parametrize("name", ["", " ", "has space", "-lead", "x" * 65, "a/b"])
+@pytest.mark.parametrize("name", ["", " ", "has space", "-lead", "x" * 129, "a/b"])
 def test_metric_names_are_validated(name):
     with pytest.raises(ValidationError, match="invalid metric name"):
         EvaluatorOutcome(evaluator_key="k", status="ok", metrics={name: 1.0})

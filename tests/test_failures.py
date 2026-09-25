@@ -19,6 +19,7 @@ EXPECTED = {
     "infrastructure": {
         "rate_limited", "provider_unavailable", "timeout", "connection", "auth",
         "quota_exhausted", "storage", "budget_exceeded", "deadline_exceeded", "cancelled",
+        "internal_error",
     },
 }  # fmt: skip
 RETRYABLE = {
@@ -28,6 +29,7 @@ RETRYABLE = {
 }  # fmt: skip
 SYSTEMIC = {
     ("evaluator", "bad_request"), ("infrastructure", "auth"), ("infrastructure", "quota_exhausted"),
+    ("input", "bad_config"),
 }  # fmt: skip
 
 

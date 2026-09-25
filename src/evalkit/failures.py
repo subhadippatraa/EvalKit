@@ -42,8 +42,12 @@ _C = FailureClass
 # §7.2. `retryable` says a retry is *allowed* (with its own small cap, decided by the retry policy).
 KINDS: dict[FailureClass, dict[str, KindInfo]] = {
     _C.INPUT: {
-        k: KindInfo(False)
-        for k in ("invalid_case", "oversize", "missing_field", "duplicate_key", "bad_config")
+        **{
+            k: KindInfo(False)
+            for k in ("invalid_case", "oversize", "missing_field", "duplicate_key")
+        },
+        # a configuration the provider rejects (unknown model id, bad parameters) fails every case
+        "bad_config": KindInfo(False, systemic=True),
     },
     _C.TARGET: {
         "exception": KindInfo(False),
@@ -70,6 +74,9 @@ KINDS: dict[FailureClass, dict[str, KindInfo]] = {
         "budget_exceeded": KindInfo(False),
         "deadline_exceeded": KindInfo(False),
         "cancelled": KindInfo(False),
+        # a bug in EvalKit itself while handling a unit: not the target's, the evaluator's or the
+        # provider's fault, and never silently turned into a score
+        "internal_error": KindInfo(False),
     },
 }
 
@@ -144,6 +151,9 @@ class EvalFailure(Exception):
         http_status: int | None = None,
         request_id: str | None = None,
         retry_after_s: float | None = None,
+        subkind: str | None = None,
+        raw: Any = None,
+        exc_type: str | None = None,
     ):
         extra = {} if retryable is None else {"retryable": retryable}
         self.failure = Failure(failure_class=failure_class, kind=kind, message=message, **extra)
@@ -152,6 +162,9 @@ class EvalFailure(Exception):
         self.http_status = http_status
         self.request_id = request_id
         self.retry_after_s = retry_after_s
+        self.subkind = subkind  # provider-detected sub-case (truncated, no_tool_call, ...)
+        self.raw = raw  # rejected / partial provider output, kept as attempt evidence
+        self.exc_type = exc_type  # class name of the exception this wraps (target code raised it)
 
     @property
     def failure_class(self) -> FailureClass:

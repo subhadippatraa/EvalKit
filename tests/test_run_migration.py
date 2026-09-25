@@ -40,7 +40,8 @@ def test_released_migrations_are_never_edited_and_this_one_is_pinned():
         "704418f12ddbdf1be87617438514db423a948abd967f3853b03c9ee28b489896",  # 1 baseline
         "80a7ff182a5a0bf61f109dabdcb2501f40a64cd095ed27081c5970534d84e9ba",  # 2 p0_hardening
         "7deb3512a5db0e0ea827ee131deb02a4df73244b0ca00edc15e2009f53495bba",  # 3 datasets
-        "580ccc602d7248ea2f336cd330491fe78084ace81f28d004ebdbf06ded63150e",  # 4 runs_and_results
+        "75809807771611ba08018eb50753cfdddfba91e4411c0af742e6dba5026bb613",  # 4 runs_and_results
+        "55838dc14c3feac064f5406dff88e922cf17cf153edb7ce05d5c254d162eb5ed",  # 5 analysis
     ]
     assert [m.version for m in MIGRATIONS] == list(range(1, len(MIGRATIONS) + 1))
     assert MIGRATIONS[3].name == "runs_and_results"
@@ -62,7 +63,7 @@ def test_a_fresh_database_gets_the_run_schema(tmp_path):
     assert columns(path, "case_results") == {
         "id", "run_id", "case_id", "status", "output", "retrieved_json", "failure_class",
         "failure_kind", "failure_message", "retryable", "created_at", "started_at", "finished_at",
-        "duration_ms",
+        "duration_ms", "ord",
     }  # fmt: skip
     assert columns(path, "evaluator_results") == {
         "id", "case_result_id", "run_id", "evaluator_key", "status", "verdict", "detail_json",
@@ -97,7 +98,7 @@ def test_the_expected_triggers_and_indexes_exist(tmp_path):
     ):  # fmt: skip
         assert expected in triggers, expected
     assert {
-        "idx_case_results_status", "idx_case_results_failures", "idx_evaluator_results_key",
+        "idx_case_results_claim", "idx_case_results_failures", "idx_evaluator_results_key",
         "idx_evaluator_results_failures", "idx_metrics_aggregate", "ux_attempts_case_result",
         "ux_attempts_evaluator_result", "idx_runs_dataset_version", "idx_runs_identity",
     } <= names(path, "index")  # fmt: skip
@@ -111,7 +112,7 @@ def test_the_hot_queries_use_their_indexes(tmp_path):
     def plan(sql):
         return " ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql))
 
-    assert "idx_case_results_status" in plan(
+    assert "idx_case_results_claim" in plan(
         "SELECT * FROM case_results WHERE run_id = 'r' AND status = 'pending'"
     )
     assert "idx_metrics_aggregate" in plan(
@@ -294,7 +295,11 @@ def test_editing_migration_4_after_it_was_applied_is_detected(tmp_path):
     SQLiteStore(path).close()
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    edited = (*MIGRATIONS[:3], Migration(4, "runs_and_results", RUNS_SQL + "\n-- edited"))
+    edited = (
+        *MIGRATIONS[:3],
+        Migration(4, "runs_and_results", RUNS_SQL + "\n-- edited"),
+        MIGRATIONS[4],
+    )
     with pytest.raises(MigrationError, match="was modified after it was applied"):
         migrate(conn, path=path, backup=False, migrations=edited)
     conn.close()

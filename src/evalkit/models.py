@@ -70,14 +70,38 @@ class Criterion(BaseModel):
     labels: tuple[str, ...] | None = None
     # bounded + finite: keeps Rubric.score's weighted mean exactly representable (no inf/inf)
     weight: float = Field(default=1.0, ge=MIN_WEIGHT, le=MAX_WEIGHT, allow_inf_nan=False)
+    # Must-pass (design 6.3): the run FAILs if this criterion's normalized value is below its
+    # floor, whatever the weighted mean says, so one terrible safety score cannot hide behind
+    # good scores elsewhere. `min_normalized` defaults to 0.5 (the middle of the scale).
+    must_pass: bool = False
+    min_normalized: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
 
     @field_validator("description")
     @classmethod
     def _description_safe(cls, v: str) -> str:
         return _no_delimiters(v, "criterion description")
 
+    @property
+    def floor(self) -> float | None:
+        """The normalized value below which a must-pass criterion fails; None if not must-pass."""
+        if not self.must_pass:
+            return None
+        return 0.5 if self.min_normalized is None else self.min_normalized
+
+    def normalized(self, cs: "CriterionScore") -> float:
+        """0..1 position of an already-validated score on this criterion's scale or label order
+        (the same normalization Rubric.score averages)."""
+        if self.labels is not None:
+            assert cs.label is not None
+            return self.labels.index(cs.label) / (len(self.labels) - 1)
+        assert self.scale is not None and cs.score is not None
+        lo, hi = self.scale
+        return (cs.score - lo) / (hi - lo)
+
     @model_validator(mode="after")
     def _check_scale_or_labels(self) -> "Criterion":
+        if self.min_normalized is not None and not self.must_pass:
+            raise ValueError("`min_normalized` only applies to a `must_pass` criterion")
         if self.scale is not None and self.labels is not None:
             raise ValueError("a criterion cannot set both `scale` and `labels`")
         if self.scale is None and self.labels is None:
@@ -154,8 +178,20 @@ class Rubric(BaseModel):
         The store records it per `version` so one version label can never silently refer to
         two different rubrics. The auto version is its first 12 hex characters.
         """
-        canonical = json.dumps(self.model_dump(exclude={"version"}), sort_keys=True)
+        data = self.model_dump(exclude={"version"})
+        for criterion in data["criteria"]:
+            if not criterion["must_pass"]:  # absent from rubrics that predate must-pass, so a
+                del criterion["must_pass"], criterion["min_normalized"]  # rubric's hash is stable
+        canonical = json.dumps(data, sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def failed_gates(self, scores: dict[str, "CriterionScore"]) -> list[str]:
+        """Names of must-pass criteria whose value is below their floor."""
+        return [
+            c.name
+            for c in self.criteria
+            if c.floor is not None and c.normalized(scores[c.name]) < c.floor
+        ]
 
     @classmethod
     def from_dict(cls, criteria: dict[str, str]) -> "Rubric":
@@ -214,7 +250,8 @@ class Rubric(BaseModel):
         # can never turn NaN/inf/out-of-range into an "ok" result (audit F-1)
         if not math.isfinite(overall) or not 0.0 <= overall <= 1.0:
             raise ScoringError(f"computed overall score is not a finite value in [0, 1]: {overall}")
-        return scores, overall, "PASS" if overall >= self.threshold else "FAIL"
+        passed = overall >= self.threshold and not self.failed_gates(scores)
+        return scores, overall, "PASS" if passed else "FAIL"
 
 
 class Review(BaseModel):
@@ -301,11 +338,14 @@ class EvaluationResult(BaseModel):
             raise ValueError("an ok result needs overall_score and verdict")
         if set(self.scores) != {c.name for c in self.rubric.criteria}:
             raise ValueError("an ok result needs exactly one score per rubric criterion")
-        expected: Verdict = "PASS" if self.overall_score >= self.rubric.threshold else "FAIL"
+        gates = self.rubric.failed_gates(self.scores)
+        expected: Verdict = (
+            "PASS" if self.overall_score >= self.rubric.threshold and not gates else "FAIL"
+        )
         if self.verdict != expected:
             raise ValueError(
-                f"verdict {self.verdict} contradicts overall_score {self.overall_score} "
-                f"and threshold {self.rubric.threshold}"
+                f"verdict {self.verdict} contradicts overall_score {self.overall_score}, "
+                f"threshold {self.rubric.threshold} and failed must-pass criteria {gates}"
             )
         return self
 

@@ -67,6 +67,13 @@ def _enable_wal(conn: sqlite3.Connection) -> None:
             time.sleep(0.02)
 
 
+def _seeded_order(seed: int, case_key: str) -> int:
+    """Processing order of a case: the first 8 bytes of sha256(seed || case_key) as a non-negative
+    63-bit integer. Deterministic and uniform; a sample of N is a prefix of a sample of M."""
+    digest = hashlib.sha256(f"{seed}\x00{case_key}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") >> 1
+
+
 def _check_limit(limit: int) -> int:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIST_LIMIT:
         raise EvalKitError(
@@ -114,6 +121,7 @@ class SQLiteStore(DatasetStoreMixin, RunStoreMixin):
         try:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.create_function("evalkit_ord", 2, _seeded_order, deterministic=True)
             if self.path is not None:
                 _enable_wal(self._conn)
             migrate(self._conn, path=self.path, backup=backup)

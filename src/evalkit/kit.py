@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from evalkit.datasets import DatasetService
+from evalkit.engine import RunController
 from evalkit.limits import Limits
 from evalkit.runs import RunService
 from evalkit.store import SQLiteStore, default_db_path
@@ -25,6 +26,7 @@ class EvalKit:
         self.limits = limits or Limits()
         self.datasets = DatasetService(store, self.limits)
         self.runs = RunService(store, self.datasets, self.limits)
+        self.controller = RunController(self)
 
     @classmethod
     def open(cls, path: str | Path, limits: Limits | None = None) -> EvalKit:
@@ -35,6 +37,9 @@ class EvalKit:
     def from_env(cls, limits: Limits | None = None) -> EvalKit:
         """The database named by EVALKIT_DB_PATH (default ./evalkit.db)."""
         return cls.open(default_db_path(), limits)
+
+    def snapshot(self, run_id: str) -> None:
+        """Store a summary snapshot of the run (placeholder until analysis is wired)."""
 
     def close(self) -> None:
         self.store.close()

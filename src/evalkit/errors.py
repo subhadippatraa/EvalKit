@@ -61,11 +61,13 @@ class JudgeError(EvalKitError):
         *,
         kind: str | None = None,
         raw: Any = None,
+        failure: Any = None,
     ):
         super().__init__(scrub(message))
         self.evaluation_id = evaluation_id
         self.kind = kind
         self.raw = raw
+        self.failure = failure  # the classified `evalkit.failures.Failure`, when there is one
 
 
 class JudgeTimeoutError(JudgeError):
