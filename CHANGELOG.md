@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased - P1.1: hardening of the P1 platform
+
+Fixes the findings of the P1 audit. Migration 6 applies on open (with a backup); migrations 1-5 are
+byte-identical, the single-record `Evaluator` API, the providers' constructors and the existing CLI
+commands are unchanged.
+
+### Fixed - correctness
+
+- **A regression could pass a gate (audit P0-1).** Comparison paired cases on their full content hash,
+  which includes the system's output, so every case whose output changed dropped out and a 33-point loss
+  was reported as "equivalent". It now pairs on `(case_key, input_hash)` (prompt, context, reference,
+  relevance); unpaired cases are counted and warned about. New end-to-end tests run the real executor,
+  evaluators, comparison and gate. **Compare results of runs over different dataset versions can differ
+  from before: they were wrong.**
+- **Not-applicable could hide a regression.** The not-applicable share is now reported, compared per side,
+  warned about, and a declared gate fails on a shift over 5 points (`max_na_asymmetry`), with optional caps
+  (`max_na_share`, `max_truncated_share`).
+- **Truncated target outputs were scored as complete with no trace.** The target's stop reason and a
+  `truncated` flag are stored with the case result, visible to evaluators (`EvalInput.target_meta`),
+  counted, warned about, reported and gateable. They never reach a judge's prompt.
+- **`succeeded` now means something.** Every case terminal, every evaluator result present (a database
+  trigger), every evaluator scored something (`policy.min_coverage`). A run with no evaluator results, or in
+  which every case failed, is no longer `succeeded`; `runs execute` exits 1.
+- **Gates refuse unpinned callable targets** (`unpinned_target`), as documented; two unpinned runs are no
+  longer called "run-to-run noise".
+- **`judge-check --run RUN`** checks the run's own frozen evaluator so its result is shown in the report
+  (before, it was stored under a hard-coded name that never matched a run). `--name` for standalone checks.
+
+### Fixed - execution
+
+- A failed target whose `skipped` rows were never written stranded the run in `partial(incomplete)`;
+  such units are written atomically and repaired on resume.
+- **One executor per run** (`RunBusyError`, an OS lock released when its holder dies): two executors
+  used to make duplicate target calls. A crashed executor never blocks recovery.
+- `execute()` is exception-safe: Ctrl-C or any exception flushes in-flight results, closes the writer and
+  leaves a resumable run (`cancelled` / `partial`) instead of a run stuck in `running`.
+- A writer-thread exception no longer hangs the run: it is recorded, the queue is spilled, the run stops
+  (`infrastructure.storage` or `infrastructure.internal_error`).
+- **A single systemic-looking provider error no longer ends a run.** Auth/quota/rejected-request failures
+  must repeat (`systemic_threshold`, default 3, per provider and model). Cases caught in the stop stay
+  pending, so a resume after the fix completes them. An input too long for the model is `input.oversize`
+  (a documented, **unverified-against-a-live-provider** message heuristic).
+- **The run's `retry.timeout_s` reaches the provider request** (it was ignored by both clients); it is
+  recorded in the run environment and named by `compare` when runs differ.
+- **Paging pending units is constant-cost** (was quadratic: 187 ms/page at 100K cases; now 1.1 ms/page).
+
+### Added
+
+- Documents: `docs/EVALUATION-METHODOLOGY.md`, `docs/SECURITY.md`, `docs/DECISIONS.md`; the P1.1 section of
+  `docs/ARCHITECTURE.md` lists every deviation. `docs/BENCHMARK.md` gains a 100,000-case measurement.
+- CI: a branch-coverage floor (97%); a scheduled/manual mutation workflow. No type checker (DR-12).
+- ~150 tests (end-to-end regression detection; executor seams; realistic provider stubs via botocore's
+  `Stubber`; query-plan and instruction-count tests); 25 new mutants of the changed invariants.
+
+### Known limits (unchanged or newly documented)
+
+Live validation of the judge prompt is still pending. A `regex` evaluator with a catastrophic pattern can
+freeze the process. Compare/calibrate/report load every case of a run into memory. Throughput falls about
+44% between 10K and 100K cases (cause not established). Failed results still cannot be retried.
+
+
 ## Unreleased - P1: the evaluation platform
 
 Adds a single-process evaluation platform on the existing SQLite store. The single-record

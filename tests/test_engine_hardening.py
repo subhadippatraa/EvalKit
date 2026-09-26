@@ -187,6 +187,25 @@ def test_a_killed_executor_leaves_no_stale_lock_and_the_run_can_be_resumed(tmp_p
     kit.close()
 
 
+def test_an_in_memory_database_is_also_exclusive():
+    """No lock file without a directory: the in-process registry is what excludes here."""
+    kit = EvalKit.open(":memory:")
+    kit.datasets.import_cases(
+        "qa", [{"case_key": "c0", "prompt": "q", "output": "a", "reference": "a"}]
+    )
+    run = kit.controller.create("qa", target=PrecomputedTarget(), evaluators=[EM], policy=FAST)
+    seen = {}
+
+    def progress(n):
+        try:
+            kit.controller.execute(run.id)  # re-entrant: the run is being executed right now
+        except RunError as e:
+            seen["error"] = str(e)
+
+    kit.controller.execute(run.id, on_progress=progress)
+    assert "already being executed" in seen["error"]
+
+
 def test_the_run_lock_is_released_even_when_execute_fails(tmp_path):
     counter = Counting()
     kit, run, tgt = make(tmp_path, target=counter.target())
@@ -239,10 +258,12 @@ def test_an_exception_in_execute_flushes_in_flight_results_and_leaves_a_resumabl
 
 
 def test_resume_never_repeats_an_evaluator_call_that_was_already_paid_for(tmp_path):
-    """The audit's surviving mutant: re-running finished evaluators wasted (and re-billed) calls."""
+    """The audit's surviving mutant: re-running finished evaluators wasted (and re-billed) calls.
+    The judge's result is stored, the cheap evaluator's is missing (a crash in between): the resume
+    must make no judge call at all."""
     from conftest import judged
 
-    from evalkit import Rubric
+    from evalkit import EvaluatorOutcome, Rubric
     from evalkit.evaluators import llm_judge_spec
     from evalkit.llm import LLMResponse, Usage
 
@@ -264,20 +285,22 @@ def test_resume_never_repeats_an_evaluator_call_that_was_already_paid_for(tmp_pa
     spec = llm_judge_spec("quality", Rubric.from_dict({"quality": "Good?"}), judge)
     kit, run, tgt = make(tmp_path, n=6, evaluators=(EM, spec), policy={"concurrency": 1})
     kit.runs.start(run.id)
-    for cr in list(kit.runs.case_results(run.id)):  # a crash after the case result and the EM row
+    for cr in list(kit.runs.case_results(run.id)):
         kit.runs.record_case_result(
             run.id, cr.case_key, CaseOutcome.complete(f"a{cr.case_key[1:]}")
         )
-    from evalkit import EvaluatorOutcome
-
-    em_key = next(s.key for s in run.config.evaluators if s.kind == "exact_match")
-    for cr in kit.runs.case_results(run.id):
+    judge_key = next(s.key for s in run.config.evaluators if s.kind == "llm_judge")
+    for cr in kit.runs.case_results(run.id):  # paid for and stored: the judge's verdicts
         kit.runs.record_evaluator_result(
-            cr.id, EvaluatorOutcome(evaluator_key=em_key, status="ok", metrics={"match": 1.0})
+            cr.id,
+            EvaluatorOutcome(
+                evaluator_key=judge_key, status="ok", verdict="PASS", metrics={"score": 1.0}
+            ),
         )
     report = kit.controller.execute(run.id, clients=[judge])
     assert report.status == "succeeded"
-    assert judge.calls == 6  # one judge call per case, none repeated
+    assert judge.calls == 0  # nothing already paid for was paid for again
+    assert kit.runs.counts(run.id).evaluator_results[judge_key] == {"ok": 6}
     kit.close()
 
 

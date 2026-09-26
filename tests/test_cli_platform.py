@@ -25,6 +25,9 @@ def degraded(inp):
     n = int(inp.case_key[1:])
     return "wrong" if n % 10 == 0 else "a" + inp.prompt[1:]
 
+def broken(inp):
+    raise RuntimeError("the system under test is down")
+
 def slow(inp):
     time.sleep(0.15)
     return "a" + inp.prompt[1:]
@@ -412,3 +415,32 @@ def test_a_standalone_judge_check_can_be_named(cli, monkeypatch):
     assert code == 0 and out["evaluator_key"].startswith("llm_judge:my-judge:")
     code, _, err = cli("judge-check", "--run", "x", "--rubric", "r.json")
     assert code == 2 and "--rubric" in err
+
+
+def test_a_run_in_which_everything_failed_is_not_a_success_and_exits_1(cli):
+    run = create(cli, CALLABLE, "--target", "cli_targets:broken", "--fingerprint", "v1")
+    code, out, _ = cli("runs", "execute", run, "--target", "cli_targets:broken")
+    assert code == 1
+    assert (out["run"]["status"], out["stop_reason"]) == ("partial", "insufficient_coverage")
+    assert out["counts"]["failed"] == N and out["counts"]["complete"] == 0
+    code, shown, _ = cli("runs", "show", run)
+    assert shown["run"]["status"] == "partial"
+    assert [c for c in shown["failure_counts"] if c["failure_class"] == "target"]
+
+
+def test_a_second_execute_on_a_busy_run_is_refused_with_exit_1(cli, monkeypatch):
+    from evalkit.engine import RunController
+
+    run = create(cli, CALLABLE, "--target", "cli_targets:good", "--fingerprint", "v1")
+    seen = {}
+    real = RunController._execute_locked
+
+    def while_locked(self, *a, **k):
+        seen["second"] = cli("runs", "execute", run, "--target", "cli_targets:good")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(RunController, "_execute_locked", while_locked)
+    code, out, _ = cli("runs", "execute", run, "--target", "cli_targets:good")
+    assert code == 0 and out["run"]["status"] == "succeeded"
+    second_code, _, err = seen["second"]
+    assert second_code == 1 and "already being executed" in err

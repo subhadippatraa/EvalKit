@@ -37,6 +37,18 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.coverage.run]
+branch = true
+source = ["src/evalkit"]
+
+[tool.coverage.report]
+# A floor, not a target: coverage counts executed lines, not behaviours (the mutation suite and the
+# end-to-end regression tests are what check behaviour). 98% at P1.1; the floor leaves room for
+# honest churn but fails a change that adds untested code wholesale.
+fail_under = 97
+show_missing = true
+skip_covered = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

@@ -38,8 +38,8 @@ M = [
     (
         "sql: success without every case result",
         "migrations.py",
-        "      <> (SELECT case_count FROM dataset_versions WHERE id = OLD.dataset_version_id)",
-        "      = (SELECT case_count FROM dataset_versions WHERE id = OLD.dataset_version_id) + 999999",
+        "      <> (SELECT case_count FROM dataset_versions WHERE id = OLD.dataset_version_id)\n    OR",
+        "      = (SELECT case_count FROM dataset_versions WHERE id = OLD.dataset_version_id) + 999999\n    OR",
         ["tests/test_runs.py"],
     ),
     (
@@ -253,8 +253,8 @@ M = [
     (
         "calls: success does not reset the breaker",
         "calls.py",
-        "                self._consecutive_infra = 0\n                return",
-        "                return",
+        "                self._consecutive_infra = 0\n                self._systemic.pop(key, None)",
+        "                self._systemic.pop(key, None)",
         ["tests/test_calls.py"],
     ),
     (
@@ -382,8 +382,8 @@ M = [
     (
         "engine: failed target still evaluated",
         "engine.py",
-        "            if failed:\n                eo = EvaluatorOutcome(",
-        "            if False:\n                eo = EvaluatorOutcome(",
+        "            if outcome.failure is not None:\n                # a failed target and its skipped",
+        "            if False:\n                # a failed target and its skipped",
         ["tests/test_engine.py"],
     ),
     (
@@ -417,8 +417,8 @@ M = [
     (
         "engine: success without checking evaluators",
         "engine.py",
-        "            and all(\n                sum(counts.evaluator_results.get(spec.key, {}).values()) == complete_or_failed\n                for spec in run.config.evaluators\n            )",
-        "",
+        "            if sum(states.values()) != terminal:\n                return False",
+        "            if False:\n                return False",
         ["tests/test_engine.py"],
     ),
     (
@@ -561,13 +561,6 @@ M = [
         "compare.py",
         "for case_key in common - scored:",
         "for case_key in set():",
-        ["tests/test_compare.py"],
-    ),
-    (
-        "compare: content hash not required",
-        "compare.py",
-        'if b_out[k]["content_hash"] == c_out[k]["content_hash"]',
-        "if True",
         ["tests/test_compare.py"],
     ),
     (

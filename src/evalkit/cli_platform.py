@@ -201,6 +201,8 @@ def _execute(kit: EvalKit, args: argparse.Namespace) -> tuple[int, Any]:
         "run": report.run.model_dump(mode="json"),
         "counts": asdict(report.counts),
         "stop_reason": report.stop_reason,
+        "stop_detail": report.stop_detail,
+        "writer_error": report.writer_error,
         "units": report.units,
         "elapsed_s": round(report.elapsed_s, 3),
         "units_per_s": round(report.units_per_s, 1),

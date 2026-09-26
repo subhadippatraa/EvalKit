@@ -639,7 +639,8 @@ results are never redone. On a persistent storage failure the unwritten results 
    `ord` (seeded order) was added. No `runs.source_run_id`: a `reuse` target keeps it in its identity.
    No `cancel_requested` column (cancellation is in-process).
 3. `succeeded` means every case reached a terminal result; **coverage is enforced by gates**
-   (`Gates.min_coverage`), not by the run status.
+   (`Gates.min_coverage`), not by the run status. *(Superseded by P1.1: success also needs every
+   evaluator result and at least one scored case per evaluator; see "P1.1 hardening".)*
 4. *Pulled forward from P2 at the request of the P1 brief, in minimal form:* a rate limiter
    (fixed spacing), a consecutive-failure breaker, token / call / duration budgets, `citation_check`.
    *Not* pulled forward: adaptive concurrency, the response cache, USD price tables (prices are a
@@ -653,3 +654,95 @@ results are never redone. On a persistent storage failure the unwritten results 
 7. Run summaries are appended as history (one snapshot per execute), not a single row.
 8. Migration 4 was still unreleased when `ord` and `evaluator_count` were added, so it was edited
    in place (released migrations 1-2 are untouched; a test pins every checksum).
+
+
+## P1.1 hardening
+
+Fixes from the audit of the P1 platform (finding ids `P0-1`, `P1-n` refer to that audit). No new
+capability; it makes the P1 guarantees hold. It **supersedes** the P1 text above where they differ
+(notably deviation 3 and the "Execution model" paragraph). Rationale for each choice:
+[`DECISIONS.md`](DECISIONS.md); what the numbers mean: [`EVALUATION-METHODOLOGY.md`](EVALUATION-METHODOLOGY.md).
+
+| Module / object | Role |
+|---|---|
+| `runlock.py` | `RunLock`: one executor per run (`flock` on `<db>.locks/<run>.lock`, in-process registry for `:memory:`); `RunBusyError` |
+| migration 6 `p1_1_hardening` | `cases.input_hash` (backfilled), `case_results.meta_json`, the stricter `succeeded` trigger, pending rows must carry `ord` |
+| `hashing.case_input_hash` | the input-side identity comparison pairs on |
+
+**Schema (migration 6).** Added by a new migration; migrations 1-5 are byte-identical.
+`runs_succeeded_needs_every_case` is replaced: success needs every case terminal **and** exactly
+`terminal cases x evaluator_count` evaluator results. `case_results_pending_is_ordered` refuses a pending
+result without `ord`; `case_results_meta_*` allow metadata only on complete results. `input_hash` is
+backfilled by a migration hook that lifts and restores the `cases_no_update` trigger inside the
+migration's own transaction (a failure rolls both back; tested).
+
+**Execution model changes.**
+
+- **Exclusive execution.** `execute` holds a `RunLock` for its whole duration. A second executor gets
+  `RunBusyError` before any call; a dead executor's lock is released by the kernel.
+- **Exception safety.** The loop is wrapped: on Ctrl-C or any exception the token is cancelled, queued
+  units are dropped, running ones get a bounded grace period (`retry.timeout_s + 5`), the writer is
+  flushed and closed, the run is transitioned (`cancelled(interrupted)` or
+  `partial(infrastructure.internal_error)`) and the exception is re-raised. A result produced after the
+  writer closed is spilled, not lost.
+- **The writer cannot die silently.** Groups (`put(a, b, c)`) are written in one transaction and never
+  split. Any exception in the thread is recorded in `writer.failed`, the batch in hand and the queue
+  are spilled, and later `put`s refuse; the executor stops with `infrastructure.storage` (a storage
+  error) or `infrastructure.internal_error` (a bug) and reports `ExecutionReport.writer_error`.
+- **Failed targets** are written together with their `skipped` evaluator rows (one group). Recovery
+  (`pending_units`) now also repairs a failed case result missing them.
+- **Systemic failures.** `RunGuard` counts consecutive failures of one systemic kind per
+  `(provider, model)`, reset by a success of that provider and model; `systemic_threshold` (default 3)
+  stops the run `failed`. A systemic-looking failure is held by the executor until a later success proves
+  it case-specific (then recorded) and dropped if the run stops (its cases stay pending). At the end of
+  a run that did not stop for it, held failures are recorded.
+- **What `succeeded` means** (`RunController._complete`): terminal and complete (above), every evaluator
+  with at least one `ok` result and at least `policy.min_coverage` of its applicable cases (default
+  `0.0`), at least one evaluator. Otherwise `partial(insufficient_coverage)`.
+- **Timeouts.** `retry.timeout_s` reaches the request: OpenAI-compatible `timeout=` per call; boto3 gets a
+  client per distinct timeout (a caller-supplied client is used as is). Recorded in the run environment.
+- **Pagination.** `next_pending` orders and seeks by exactly `(ord, id)`, the columns of
+  `idx_case_results_claim`: an index range scan, no sort, constant cost per page.
+
+**Analysis and gates.** Comparison pairs on `(case_key, input_hash)`; `Comparison.unpaired`,
+`.not_applicable`, `.truncated`, `.pairs` are new. `Gates` gains `max_na_asymmetry` (default 0.05),
+`max_na_share`, `max_truncated_share`, `allow_unpinned`. Gate failure codes added: `unpinned_target`,
+`not_applicable_asymmetry`, `not_applicable_share`, `truncated_share`. `EvaluatorSummary` gains
+`not_applicable_share`; `RunSummary` gains `truncated_outputs`. `CaseResult.meta` / `CaseOutcome.meta` /
+`EvalInput.target_meta` carry what a target reported about its output.
+
+**CLI.** `judge-check --run RUN [--evaluator NAME]` checks the run's own frozen evaluator;
+`--name` names a standalone check; the built-in golden set is refused for another rubric. `runs execute`
+exits `1` for anything but `succeeded`, including `partial(insufficient_coverage)`.
+
+### Deviations from `TARGET-ARCHITECTURE.md` added or changed by P1.1
+
+Numbering continues the P1 list above.
+
+9. **Success requires scoring something, not the design's `min_coverage` default.** The design says
+   "coverage at least `min_coverage`" (0.95 for gates). The run-level default is `0.0` with a hard
+   requirement of at least one scored result, because failed results cannot be retried yet (`--retry-failed`
+   is P2) and a 0.95 default would make ordinary runs permanently `partial`. Gates keep the real bar.
+10. **Run exclusivity by an OS lock**, not by the design's leases and heartbeat (P2). Exclusion only; no
+    multi-worker claim of units.
+11. **Systemic failures need repetition** and are held until proven case-specific; the design's "zero
+    successes" is refined to "no success of the same provider and model in between".
+12. **Pairing on the input side.** The design pairs on `case_key + case content_hash`; the content hash
+    includes the system's output, which made precomputed comparisons drop changed cases.
+13. **Truncation is stored on the case result** (`meta_json`) instead of on the design's attempt columns
+    (which do not exist yet), so evaluators and reports can see it without joining attempts.
+14. **Analysis is not "pure".** The design (§2.1) says analysis is pure (rows in, numbers out). Only
+    `stats.py` is; `summarize`, `compare`, `calibrate` and `report` read the store through the `EvalKit`
+    object. The import-direction test only sees top-level imports, so it cannot see this; it is stated here
+    instead of being hidden.
+15. **No type checker** (see `DECISIONS.md`, DR-12). Mutation testing runs on a schedule, not per push.
+
+### Remaining P2 work
+
+`--retry-failed`; leases and multi-process workers; adaptive concurrency and per-provider limiters; the
+response cache; USD-priced budgets and `--confirm-above`; `samples=k` self-consistency and UNCERTAIN
+verdicts; cross-process cancellation and `run status`; structured logging and metrics; `evalkit gc`;
+a fuller run environment (provider region, base URL host, SDK versions, git SHA); streaming analysis
+(compare/calibrate/report hold every case in memory); a subprocess or `re2` for the regex evaluator;
+benchmarks at 1M cases; and live validation of the judge prompt and of the over-long-input heuristic
+once provider credentials work.

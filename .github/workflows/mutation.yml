@@ -1,0 +1,27 @@
+name: Mutation tests
+
+# Every mutant of the invariants that matter must be killed by the tests (scripts/mutation.py). The
+# full set takes tens of minutes, so it runs weekly and on demand rather than on every push
+# (docs/DECISIONS.md, DR-13). A surviving mutant is a defect in the tests.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run the mutation suite
+        run: uv run python scripts/mutation.py

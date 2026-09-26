@@ -1580,6 +1580,13 @@ Goal: make the single-record path trustworthy *before* building on it.
 > "P1 platform: runs, execution, analysis". Measured throughput: `docs/BENCHMARK.md`. **Not yet
 > done:** validation of the judge prompt against a live model (the development credentials could not
 > invoke Bedrock).
+>
+> **P1.1 hardening.** An audit of the P1 platform found (and P1.1 fixed) defects against this design:
+> §9.2 pairing must key on the *input side* of a case, not its full content hash (which includes the
+> system's output); §8.4 stops a run on a *repeated* systemic failure, not the first; §4.2 `succeeded`
+> requires scored coverage; §8.5 needs one executor per run; §6.2 `not_applicable` must not be a way to
+> leave a metric; §10 unpinned callable targets are refused by gates. The additional deviations and the
+> remaining P2 list are in `docs/ARCHITECTURE.md`, "P1.1 hardening".
 
 **Dependencies:** P0 (migrations, finite invariants, encoding). New third-party dependency: `jsonschema` (or a documented smaller alternative) — see §20.
 **Tests required:** unit tests per evaluator incl. hand-computed retrieval fixtures (nDCG worked examples); taxonomy mapping tests for every row of §7.4; state-machine tests for unit/run statuses; **provider contract tests** with recorded real SDK response fixtures (Bedrock/OpenAI shapes, including guardrail/filter stop reasons); comparison tests (confounder detection, exclusions, survivorship warning); **statistical simulation tests** (§9.3); calibration math tests; report escaping/XSS tests (script tags in outputs); e2e: import → run (fake target+judge) → compare → gate exit code; concurrency test at engine level (bounded in-flight never exceeds window; writer queue backpressure); migration tests for `0003+`.

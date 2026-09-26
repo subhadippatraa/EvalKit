@@ -189,9 +189,9 @@ def test_credentials_that_expire_mid_run_stop_it_but_keep_what_was_scored(tmp_pa
     kit.close()
 
 
-def test_a_systemic_failure_that_ends_with_the_dataset_is_still_recorded(tmp_path):
-    """Two rejected cases and nothing after them: the run ends normally, so they are what they look
-    like -- those cases' failures -- and are recorded (never silently dropped)."""
+def test_two_rejected_cases_are_recorded_as_their_own_failures(tmp_path):
+    """Two rejected cases: the run ends normally, so they are what they look like -- those cases'
+    failures -- and are recorded (never silently dropped)."""
     kit = setup(tmp_path, n=6, bad={4, 5})
     judge = Judge(reject=lambda text: "BADINPUT" in text)
     run = judge_run(kit, judge, {"concurrency": 1})
@@ -242,4 +242,40 @@ def test_the_request_timeout_is_recorded_with_the_run_and_named_when_runs_differ
     kit.controller.execute(slow.id, clients=[judge])
     cmp = compare(kit, fast.id, slow.id)
     assert any("request timeout" in i and "5" in i and "90" in i for i in cmp.informational)
+    kit.close()
+
+
+def test_a_failure_proven_case_specific_survives_a_later_systemic_stop(tmp_path):
+    """One rejected case early on, then successes prove it was the case's own; later the credentials
+    expire and the run stops. The rejected case's failure must have been recorded by then (only the
+    failures of the stop itself are dropped)."""
+    from evalkit.store import _seeded_order
+
+    # cases run in seeded hash order: make the rejected one the third to be processed
+    keys = sorted((f"c{i:03}" for i in range(N)), key=lambda k: _seeded_order(0, k))
+    third = keys[2]
+    kit = setup(tmp_path, bad={int(third[1:])})
+    state = {"n": 0}
+    lock = threading.Lock()
+
+    class Judge2(Judge):
+        def call(self, req):
+            with self.lock:
+                self.calls += 1
+            if "BADINPUT" in req.user:
+                raise EvalFailure("evaluator", "bad_request", "400 rejected", provider="fake")
+            with lock:
+                state["n"] += 1
+                expired = state["n"] > 12
+            if expired:
+                raise EvalFailure("infrastructure", "auth", "ExpiredToken", provider="fake")
+            return LLMResponse(payload=judged(quality=5), stop_reason="tool_use", usage=Usage(1, 1))
+
+    judge = Judge2()
+    run = judge_run(kit, judge, {"concurrency": 1})
+    report = kit.controller.execute(run.id, clients=[judge])
+    assert (report.status, report.stop_reason) == ("failed", "infrastructure.auth")
+    recorded = [(f.case_key, f.failure.kind) for f in kit.runs.failures(run.id)]
+    # proven case-specific by the successes after it, so kept; the auth failures were dropped
+    assert recorded == [(third, "bad_request")]
     kit.close()

@@ -20,7 +20,10 @@ gates, human calibration, and a self-contained HTML report. See
 [Evaluation platform](#evaluation-platform). It is *not* a distributed system, a dashboard or an
 HTTP service (see [Limitations](#limitations)). Providers: **AWS Bedrock** (Converse) and Bedrock's
 OpenAI-compatible endpoint. Design details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-[`docs/TARGET-ARCHITECTURE.md`](docs/TARGET-ARCHITECTURE.md).
+[`docs/TARGET-ARCHITECTURE.md`](docs/TARGET-ARCHITECTURE.md); what the numbers mean:
+[`docs/EVALUATION-METHODOLOGY.md`](docs/EVALUATION-METHODOLOGY.md); threat model:
+[`docs/SECURITY.md`](docs/SECURITY.md); why things are the way they are:
+[`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## Install
 
@@ -288,8 +291,10 @@ params = { rubric = { criteria = [{ name = "correctness", description = "Is it c
 
 [policy]                       # execution only: never part of a run's identity
 concurrency = 4
-retry = { max_attempts = 4, base_s = 1.0, cap_s = 30.0, timeout_s = 60.0 }
+retry = { max_attempts = 4, base_s = 1.0, cap_s = 30.0, timeout_s = 60.0 }  # timeout_s: every provider request
 budget = { max_tokens = 2000000, max_calls = 50000, max_duration_s = 3600 }
+systemic_threshold = 3         # stop only when auth / a rejected request repeats this many times
+min_coverage = 0.0             # a run whose evaluators scored less than this share does not "succeed"
 ```
 
 **Targets** produce the output being scored. `precomputed`: the dataset's own `output`.
@@ -317,24 +322,42 @@ with bounds for UNCERTAIN verdicts, latency, tokens, slices by tag. **Below the 
 headline value is withheld** (the observed mean stays visible and flagged).
 
 **Stopping and resuming.** Ctrl-C (or `CancelToken`) stops dispatch and lets in-flight cases finish;
-budgets, a tripped provider breaker and systemic failures (auth, bad model id) stop the run as
-`cancelled` / `partial` / `failed`, keeping every result. `evalkit runs resume RUN` finishes what is
-left, including cases whose evaluators were interrupted by a crash. If storage itself fails,
-unwritten results are spilled to `<db>.spill/<run>.jsonl` and replayed on the next execute.
+budgets, a tripped provider breaker and *repeated* systemic failures (auth, a rejected model or
+request: the same failure three times in a row from one provider and model) stop the run as
+`cancelled` / `partial` / `failed`, keeping every result. One rejected request is that case's failure,
+not the run's; an input too long for the model is `input.oversize`. Cases caught in a systemic stop are
+left pending, so `evalkit runs resume RUN` after the fix does the remaining work; it also finishes
+cases whose evaluators were interrupted by a crash, including a failed target's stranded rows. Any
+exception (including Ctrl-C twice) flushes what is in flight and leaves a resumable run. If storage
+itself fails, unwritten results are spilled to `<db>.spill/<run>.jsonl` and replayed on the next
+execute. **One executor per run:** a second `execute` on a run that is being executed raises an error
+and makes no call (an OS lock that dies with its holder, so a crashed executor never blocks recovery).
+A run **succeeds** only if every case is terminal, every evaluator has a result for every case, and
+every evaluator scored something (`min_coverage`); a run in which everything failed is
+`partial(insufficient_coverage)`.
 
 **Comparing runs fairly.** `evalkit compare CAND --baseline RUN|tag:main [--gates gates.toml]`
-pairs results by case. It refuses a *confounded* comparison (different judge model, rubric, prompt
+pairs results by case key and the case's *input* (prompt, context, reference, relevance) — never by the
+system's output, so a changed answer is exactly what gets compared — and counts cases it could not
+pair. It refuses a *confounded* comparison (different judge model, rubric, prompt
 fingerprint, evaluator parameters, scoring version) unless `--allow-confounders`; reports excluded
 cases and a survivorship warning; and gives per metric n, the paired difference with a 95% interval,
 the minimum detectable difference, higher/lower/tied counts and (for proportions) an exact McNemar
-p-value. Each declared gate decides REGRESSION / IMPROVEMENT / EQUIVALENT / INCONCLUSIVE from the
+p-value. It also compares the **not-applicable share** of each metric (a candidate must not be able to
+hide a regression by leaving a metric: an asymmetry over 5 points fails a declared gate) and the share
+of truncated outputs. Each declared gate decides REGRESSION / IMPROVEMENT / EQUIVALENT / INCONCLUSIVE from the
 interval against your tolerance; fewer than 30 pairs is always INCONCLUSIVE, and a candidate below
 the minimum coverage cannot pass. Exit codes: `0` pass, `1` error, `2` usage, `3` gate failed, `4`
-inconclusive under `--strict`.
+inconclusive under `--strict`. A gate also refuses a callable target that declares no `fingerprint`
+(EvalKit cannot hash code). Methodology in [`docs/EVALUATION-METHODOLOGY.md`](docs/EVALUATION-METHODOLOGY.md).
 
 ```toml
 # gates.toml: only declared gates can fail a build
 min_coverage = 0.95
+max_na_asymmetry = 0.05        # default; the not-applicable share may not move more than this
+# max_na_share = 0.5           # optional cap on the candidate's not-applicable share
+# max_truncated_share = 0.05   # optional cap on truncated target outputs
+# allow_unpinned = true        # accept a callable target with no fingerprint
 [gates]
 "exact_match:answer.match" = { direction = "higher", delta = 0.02 }
 "run.target_failure_rate"  = { direction = "lower",  delta = 0.005 }
@@ -349,7 +372,9 @@ agreement from random-sample reviews only (`UNCALIBRATED` below 30). `runs queue
 (`random`, `stratified`) or triage (`uncertain`, `disagreement`) review queues, and
 `runs disagreements` compares evaluators per case. `evalkit judge-check` runs a golden set with
 adversarial cases (hidden instructions, verbosity padding, forged delimiters, injected context)
-through the configured judge and stores its accuracy per evaluator key.
+through a judge and stores its accuracy per evaluator key. Use `judge-check --run RUN` to check the
+run's own frozen evaluator, so the report shows it (the built-in set is only for the built-in rubric;
+give `--cases` for yours).
 
 **Report.** `evalkit report RUN --out report.html [--compare tag:main --gates gates.toml]` writes one
 static file (inline CSS, no JavaScript, no network, CSP `default-src 'none'`); all case text, model
@@ -378,19 +403,25 @@ gate = evaluate_gates(kit, run.id, Gates.from_file("gates.toml"), cmp)   # gate.
 - **One process, one SQLite file** on a local filesystem. Threads, not workers: no multi-process or
   multi-host execution, no leases. Measured numbers are in [`docs/BENCHMARK.md`](docs/BENCHMARK.md);
   nothing here claims distributed or 1M-case production scale.
-- **Not in P1** (designed for P2): retrying *failed* results on resume (`--retry-failed`; terminal
-  results are write-once), adaptive concurrency, per-provider limiter tables, the LLM response
+- **Not built** (P2): retrying *failed* results on resume (`--retry-failed`; terminal results are
+  write-once; only cases caught in a systemic stop are left pending), adaptive concurrency, per-provider limiter tables, the LLM response
   cache, USD-priced budgets (budgets are tokens / calls / duration; cost is an estimate from
   user-supplied prices), `evalkit gc`, samples-per-case self-consistency, run cancellation from another
   process, structured logging/metrics export.
 - **Callable targets are trusted code** with full process privileges, are timed out but not killed
   (a timed-out function keeps running in its thread), and may be called twice for one case (a timeout
   is retried once): make them safe to call twice. There is no `http` target.
+- **The run lock is local**: an OS lock on the database's own filesystem; not for network filesystems.
+  A `regex` evaluator with a catastrophic pattern can freeze the whole process on a crafted output
+  (see [`docs/SECURITY.md`](docs/SECURITY.md)). Compare, calibrate and report read every case of a run
+  into memory (450 MB at 100K cases).
 - **LLM judges can be talked into a score**; injection is made detectable (golden set, calibration,
   deterministic evaluators), not preventable. The built-in golden set is small and hand-labelled.
   **Live validation of the judge prompt against a real model is still pending**: the credentials
   available while developing could not invoke Bedrock models (`ValidationException: Operation not
-  allowed`), so the provider clients and prompts are tested against recorded-shape fakes only.
+  allowed`), so the provider clients are tested against botocore's `Stubber` (real service-model
+  shapes) and the prompts against fakes only; the over-long-input recognition is a heuristic that has
+  not met a live provider.
 - Statistics are stdlib-only and stated with their limits: a 60-case dataset cannot show a change
   smaller than about 10 points (comparisons print the minimum detectable difference).
 
@@ -420,7 +451,7 @@ evalkit runs create|execute|resume|list|show|failures|verify ... # runs (platfor
 evalkit runs tag|review|calibrate|queue|disagreements ...       # baselines, human calibration
 evalkit compare CAND --baseline RUN|tag:NAME [--gates FILE] [--strict] [--allow-confounders]
 evalkit report RUN --out report.html [--compare BASELINE] [--gates FILE] [--max-cases N] [--force]
-evalkit judge-check [--cases FILE] [--rubric FILE] [--min-accuracy X]
+evalkit judge-check [--run RUN [--evaluator NAME]] [--cases FILE] [--rubric FILE] [--name N] [--min-accuracy X]
 ```
 
 `input.json` uses the same keys as `evaluate()`; `rubric` may be given as a JSON object:
@@ -544,9 +575,9 @@ None` (with `.reviews` populated), `list(tag=None, limit=20)` and `add_review(re
 ```bash
 uv run pytest            # no network or AWS calls: fake judges + stubbed Bedrock client
 uv run ruff check . && uv run ruff format --check .
-uv run --with coverage coverage run --branch --source=evalkit -m pytest -q && uv run --with coverage coverage report
-uv run python scripts/mutation.py     # ~100 targeted mutants of the invariants; every one must be killed
-uv run python scripts/benchmark.py --cases 10000    # local throughput; see docs/BENCHMARK.md
+uv run --with coverage coverage run -m pytest -q && uv run --with coverage coverage report   # floor in pyproject.toml
+uv run python scripts/mutation.py     # ~125 targeted mutants of the invariants (~30 min); every one must be killed
+uv run python scripts/benchmark.py --cases 10000    # local throughput (also 100000); see docs/BENCHMARK.md
 ```
 
 A real Bedrock smoke test is manual. With AWS credentials and model access configured, run
