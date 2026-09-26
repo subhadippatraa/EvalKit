@@ -51,8 +51,9 @@ commands are unchanged.
 - Documents: `docs/EVALUATION-METHODOLOGY.md`, `docs/SECURITY.md`, `docs/DECISIONS.md`; the P1.1 section of
   `docs/ARCHITECTURE.md` lists every deviation. `docs/BENCHMARK.md` gains a 100,000-case measurement.
 - CI: a branch-coverage floor (97%); a scheduled/manual mutation workflow. No type checker (DR-12).
-- ~150 tests (end-to-end regression detection; executor seams; realistic provider stubs via botocore's
-  `Stubber`; query-plan and instruction-count tests); 25 new mutants of the changed invariants.
+- 124 new tests (1,809 in total: end-to-end regression detection; executor seams; realistic provider
+  stubs via botocore's `Stubber`; query-plan and instruction-count tests); 24 new mutants of the changed
+  invariants (126 in total, all killed).
 
 ### Known limits (unchanged or newly documented)
 

@@ -185,7 +185,29 @@ def test_ctrl_c_cancels_gracefully_and_the_run_resumes(cli):
         "--fingerprint",
         "1",
     )
-    timer = threading.Timer(0.5, os.kill, args=(os.getpid(), signal.SIGINT))
+
+    def interrupt_once_a_case_is_done():
+        """Ctrl-C after the first case has been stored (not after a fixed delay, which a loaded
+        machine can miss: the interrupt must land while the run is executing)."""
+        import sqlite3
+        import time
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                conn = sqlite3.connect(cli.tmp / "cli.db", timeout=5)
+                (done,) = conn.execute(
+                    "SELECT COUNT(*) FROM case_results WHERE status <> 'pending'"
+                ).fetchone()
+                conn.close()
+            except sqlite3.OperationalError:
+                done = 0
+            if done >= 1:
+                break
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    timer = threading.Thread(target=interrupt_once_a_case_is_done)
     timer.start()
     code, out, err = cli("runs", "execute", run, "--target", "cli_targets:slow")
     timer.join()
