@@ -737,12 +737,77 @@ Numbering continues the P1 list above.
     instead of being hidden.
 15. **No type checker** (see `DECISIONS.md`, DR-12). Mutation testing runs on a schedule, not per push.
 
+## P2.1 production operations
+
+Retry, cache, cost and budgets, events, a reproducibility snapshot and observability, on the same
+one-process, one-SQLite-file architecture. Rationale: [`DECISIONS.md`](DECISIONS.md) DR-15 to DR-25;
+what the numbers mean: [`EVALUATION-METHODOLOGY.md`](EVALUATION-METHODOLOGY.md) §10-§13.
+
+| Module / object | Role |
+|---|---|
+| `pricing.py` | `PriceTable`: versioned, user-supplied prices; unpriced and no-usage are `None`, never zero |
+| `cache.py` | cache key (every request field + provider, model, endpoint, scope), codec, `CachePolicy`, `ResponseCache` with a per-key lock |
+| `events.py` | structured events: an allow-list of fields, JSON / text formatters, `configure_logging` |
+| `calls.py` | `RunGuard.reserve` (per-call budget reservation), `UnitCalls.run` (cache lookup, cost, events), `UnitAbandoned` |
+| `envsnapshot.py` | the frozen environment, the per-execution runtime record, `environment_differences` |
+| `ops_store.py` | cache table, `run_executions`, `spend_totals` (mixin on `SQLiteStore`) |
+| `run_store.py` | retry: `count_retryable`, `reopen_failed_cases`, `retry_units`, `_replace_evaluator_result`, `failure_history` |
+| `operations.py` | `run_status` / `format_status`: the observability dictionary the CLI and report share |
+
+**Call path.** Every provider call of a unit (target or evaluator) goes through `UnitCalls.run`:
+limiter, then (for an LLM request) cache key and lookup under the key's lock; on a hit the response is
+re-validated and recorded as a `cache_hit` attempt (zero cost, no tokens); on a miss the call's worst
+case is *reserved* against the budget under the guard's lock (or the call is refused: `UnitAbandoned`),
+sent, validated, written to the cache, and recorded with its tokens and cost. A response that arrived
+but failed validation records its tokens too. `RunGuard.record` replaces the reservation by what was
+really used.
+
+**Abandoned units.** A refused call (budget) or a replay miss raises `UnitAbandoned`. The executor
+records nothing for the unit: it stays pending, the guard is `blocked`, dispatch stops and the run ends
+`partial(budget)` / `partial(cache_miss)`. If the refusal comes after a real attempt in the same call
+(a retry the budget will not pay for) the call ends as `infrastructure.budget_exceeded` with the
+evidence kept, which `--retry-failed` retries.
+
+**Retry-failed.** `execute(run_id, retry_failed=True)` (under the run lock): count eligible failures
+(`failures.retry_eligible`, mirrored in SQL and tested equal); write an `execution` row (for a
+`succeeded` run it is the ticket the database requires to reopen it); reopen the run; reopen failed
+*case* results in chunks (failure archived in `result_history`, `skipped` rows removed, attempts kept);
+enumerate failed *evaluator* results as retry units; then run the ordinary pipeline. A retried
+evaluator's outcome replaces its failed row in place (`evaluator_retry` write item: archive, update,
+metrics, attempts continuing at `n+1`). Crash safety: every step is one transaction; a reopened case is
+simply pending on the next execute; a retried result already stored is a duplicate, never overwritten.
+
+**Schema (migration 7).** `attempts` +`cache_hit, cache_key, cost_usd, price_version, retry_round`;
+`case_results` / `evaluator_results` +`retry_round`; tables `result_history` (append-only),
+`run_executions` (finished once), `llm_cache`. Replaced triggers: `runs_legal_transition` (a
+`succeeded` run reopens only for an execution naming its `finished_at`), `case_results_write_once`
+(`failed -> pending` only with the failure archived and the round advanced by one),
+`evaluator_results_no_update` (`failed -> ok|not_applicable|failed` on the same terms),
+`evaluator_results_no_delete` (only `skipped` rows of a reopened case). Each has raw-SQL tests including
+the forged-history cases (`tests/test_p2_schema.py`).
+
+### Deviations from `TARGET-ARCHITECTURE.md` added by P2.1
+
+16. **Retry replaces in place**, with `result_history`, instead of the design's
+    `INSERT ... ON CONFLICT DO UPDATE WHERE status != 'ok'` upsert: the write-once triggers stay, and
+    every earlier attempt stays attached to the same row.
+17. **The cache is off by default** (the design caches judge calls by default) and **its key includes the
+    evaluator/target scope**; `--cache-only` is `--cache replay`, and a replay miss stops the run rather
+    than being a stored `infra.cache_miss` failure.
+18. **Budgets reserve per call** and count earlier executions (tokens, USD); the design's guarantee
+    `spend <= budget + window x max_unit_cost` is replaced by "a call is made only if its worst case
+    fits". `max_calls` is per execution (P1 behaviour kept).
+19. **No packaged price table** (the design ships one): EvalKit cannot verify provider prices, so the
+    operator supplies a versioned table; unpriced is unknown.
+20. A per-execution table (`run_executions`) instead of a `run cancel` / heartbeat column; there is still
+    no cross-process cancellation.
+
 ### Remaining P2 work
 
-`--retry-failed`; leases and multi-process workers; adaptive concurrency and per-provider limiters; the
-response cache; USD-priced budgets and `--confirm-above`; `samples=k` self-consistency and UNCERTAIN
-verdicts; cross-process cancellation and `run status`; structured logging and metrics; `evalkit gc`;
-a fuller run environment (provider region, base URL host, SDK versions, git SHA); streaming analysis
-(compare/calibrate/report hold every case in memory); a subprocess or `re2` for the regex evaluator;
-benchmarks at 1M cases; and live validation of the judge prompt and of the over-long-input heuristic
-once provider credentials work.
+Superseding the P1.1 list. Not built, and not required by any workflow above: multi-process workers and leases; adaptive
+concurrency and per-provider limiter tables; `samples=k` self-consistency and UNCERTAIN verdicts;
+cross-process cancellation; `evalkit gc` and cache eviction (there is `cache clear`); streaming
+analysis (compare / calibrate / report hold every case in memory); a subprocess or `re2` for the regex
+evaluator; benchmarks at 1M cases; and live validation of the judge prompt, of the over-long-input
+heuristic and of cost estimates once provider credentials work.
+

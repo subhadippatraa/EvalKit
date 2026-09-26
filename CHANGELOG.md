@@ -1,5 +1,84 @@
 # Changelog
 
+## Unreleased - P2.1: production operations
+
+Retry, cache, cost and budgets, structured events, a reproducibility snapshot and run-level
+observability. Migration 7 applies on open (with a backup); migrations 1-6 are byte-identical, the
+single-record `Evaluator` API, the providers' constructors and every existing CLI command and
+exit code are unchanged. Every new behaviour is opt-in: with no new flag or policy key a run behaves as
+before (the response cache is **off** by default).
+
+### Added
+
+- **`--retry-failed`** (`runs execute|resume RUN --retry-failed`, `controller.execute(...,
+  retry_failed=True)`). Failed units whose failure is retryable (`infrastructure.rate_limited`,
+  `provider_unavailable`, `timeout`, `connection`, `target.timeout`, and units cut short by a deadline
+  or a budget) get another try; `evaluator.invalid_output`, systemic failures and everything
+  non-retryable never do. Only failed units are touched: no successful result and no successful
+  provider call is repeated. The failed result is replaced **in place** (same row, so every earlier
+  attempt stays attached, numbering continues) after its failure is archived in `result_history`; a
+  unit is retried at most `policy.retry_failed_rounds` (3) times. A `succeeded` run with retryable
+  failures is reopened for it (a database rule accepts that only for an execution that names the run's
+  `finished_at`); with nothing to retry the run is left untouched. `runs failures RUN --history` lists
+  the superseded failures; `runs show` shows retry history and executions.
+- **Response cache** (`--cache readwrite|replay`, `policy.cache`, `evalkit cache stats|clear`). Content-
+  addressed: the key covers every request field (system, user, tool schema, temperature, max_tokens,
+  sample index, role), the provider, model, endpoint and the evaluator/target scope. Only validated
+  successes are stored; only deterministic requests (`temperature <= cache.max_temperature`, default 0)
+  are cached; target calls only with `--cache-targets`. `replay` never calls the provider: a miss stops
+  the run `partial(cache_miss)`. Identical requests in flight together are paid for once. Every attempt
+  records `cache_hit` and its `cache_key`; reports and `runs status` show hits, misses and hit rate.
+- **Token and cost tracking.** Provider-reported tokens are stored on every attempt, including a paid
+  response that failed validation (before, those were recorded as zero). Cost is an **estimate** from a
+  versioned price table you supply (`--pricing FILE`, `policy.pricing`; frozen with the run; the
+  version is stored on each attempt). An unpriced model or a provider that reported no usage is
+  **unknown**, never zero; a cache hit is exactly 0.0.
+- **Budgets enforced per call.** `--max-tokens`, `--max-cost-usd` (needs prices for every paid model;
+  refused at preflight otherwise) and `--max-calls`. A call is made only if its worst case (a UTF-8
+  upper bound on its input tokens + its output cap) fits what is left, atomically across workers, so
+  concurrent workers cannot overspend; the response then replaces the reservation with actual usage
+  (unreported usage is assumed to be the worst case). A refused call is not made and its unit stays
+  pending; the run stops `partial(budget)` and resumes with a larger budget. Token and USD budgets are
+  **per run** (earlier executions count); `max_calls` and `max_duration_s` stay per execution.
+- **Structured events** (`--log-level`, `--log-format json|text`, `--log-file`, `EVALKIT_LOG_*`):
+  `run.started/finished`, `provider.call`, `provider.retry/failed`, `cache.hit/miss`, `target/evaluator
+  .finished/failed`, `retry_failed.reopened`, `budget.exhausted`, `unit.abandoned`, each with run_id,
+  case_key, evaluator, attempt, duration, failure class/kind, request id and a per-stage correlation id.
+  Only an allow-list of identifier and number fields can be logged: never a prompt, output, reference,
+  rubric or provider message, and nothing to switch that on.
+- **Reproducibility snapshot.** The frozen run environment now records EvalKit version and commit,
+  Python and platform, SDK versions, the dataset (ref, version id, content hash, size), target and
+  judge provider/model/generation settings, evaluator, prompt and scoring versions, retry and timeout
+  settings, cache and budget configuration and the pricing table (version and hash). Each execution
+  also records its runtime and the endpoints (region / host) it used. `compare` treats a different
+  endpoint or a different `validation_retries` as a **confounder**; runtime, SDK, price-table and timeout
+  differences are informational.
+- **Observability.** `runs status RUN [--format text]`, an `operations` block in `runs execute` output
+  and a summary on stderr, and an **Operations** section in the static HTML report (cases, evaluator
+  coverage, provider calls, retries, cache, tokens, estimated cost, duration, budget state, executions,
+  reproducibility). The report stays one self-contained, CSP-locked file.
+- `evalkit cache stats|clear [--older-than-days N]`; `examples/pricing.example.toml`.
+
+### Changed
+
+- Attempts gain `cache_hit`, `cache_key`, `cost_usd`, `price_version`, `retry_round`; results gain
+  `retry_round`; new tables `result_history`, `run_executions`, `llm_cache` (migration 7). The write-once
+  triggers of case and evaluator results now allow exactly two transitions: reopening a *failed* result
+  with its failure archived, and replacing a *failed* evaluator result the same way. A successful
+  result can never change. `runs verify` also checks that retry rounds match the archived failures.
+- A free target's (`precomputed`, `reuse`) case result is now stored together with its first evaluator
+  result, so a unit whose evaluator call the budget refuses is left wholly pending.
+- `RunSummary.usage` gains `cache`, `provider_calls`, `price_versions`, `cost_complete`,
+  `unknown_usage_attempts`; its cost comes from the stored per-attempt costs (a caller-supplied `prices`
+  mapping still works).
+- LLM clients expose an optional `endpoint` (region / host only) used in the cache key and environment.
+
+### Not done (see docs/ARCHITECTURE.md "Remaining work")
+
+Multi-process workers and leases, adaptive concurrency, self-consistency sampling, streaming analysis,
+cross-process cancellation, `evalkit gc`. Live-provider validation of cost estimates and of the cache
+was not possible (no working Bedrock credentials): both are tested against fakes only.
+
 ## Unreleased - P1.1: hardening of the P1 platform
 
 Fixes the findings of the P1 audit. Migration 6 applies on open (with a backup); migrations 1-5 are

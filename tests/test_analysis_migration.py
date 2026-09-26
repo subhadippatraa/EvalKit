@@ -33,7 +33,7 @@ def upto(path, n):
 def test_a_fresh_database_gets_the_analysis_schema(tmp_path):
     path = tmp_path / "new.db"
     SQLiteStore(path).close()
-    assert applied(path) == ALL and ALL[-1] == 6 and NEW_TABLES <= tables(path)
+    assert applied(path) == ALL and ALL[-1] == 7 and NEW_TABLES <= tables(path)
     assert columns(path, "reviews") == {
         "id", "evaluation_id", "case_result_id", "evaluator_key", "sample", "reviewer", "score",
         "verdict", "comment", "created_at",

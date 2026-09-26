@@ -266,6 +266,13 @@ class RunAttempt(BaseModel):
     request_id: str | None = Field(default=None, max_length=256)
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
+    cache_hit: bool = False  # served from the response cache: no provider call, no spend
+    cache_key: str | None = None  # the cache entry looked up (set on hits *and* misses)
+    # ESTIMATED cost in USD from the run's price table; None = unknown (unpriced model, or the
+    # provider reported no usage), never zero-by-default. A cache hit is exactly 0.0.
+    cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    price_version: str | None = Field(default=None, max_length=64)  # the table the cost used
+    retry_round: int = Field(default=0, ge=0)  # 0 = the original try; n = the n-th `--retry-failed`
     raw: str | None = None  # rejected / partial output as text (failed attempts only)
     raw_sha256: str | None = None  # of the full, untruncated text
     raw_truncated: bool = False
@@ -289,6 +296,15 @@ class RunAttempt(BaseModel):
                 )
         if self.raw_truncated and self.raw is None:
             raise ValueError("raw_truncated is set but no evidence is kept")
+        if self.cache_key is not None and not _SHA_RE.match(self.cache_key):
+            raise ValueError("cache_key must be 64 lowercase hex characters")
+        if self.cache_hit:
+            if self.outcome != "ok" or self.cache_key is None:
+                raise ValueError("a cache hit is a successful attempt with its cache_key")
+            if self.input_tokens is not None or self.output_tokens is not None:
+                raise ValueError("a cache hit spent no tokens; it records none")
+            if self.cost_usd != 0.0:
+                raise ValueError("a cache hit costs exactly 0.0")
         if self.outcome == "ok":
             if self.error_class or self.error_kind or self.error or self.error_type or self.raw:
                 raise ValueError("a successful attempt carries no error and no kept evidence")
@@ -429,6 +445,7 @@ class CaseResult(BaseModel):
     started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
     duration_ms: int | None = Field(default=None, ge=0)
+    retry_round: int = Field(default=0, ge=0)  # times `--retry-failed` gave this result a new try
     attempts: list[RunAttempt] = Field(default_factory=list)  # target calls; empty if not loaded
 
     @model_validator(mode="after")
@@ -530,6 +547,7 @@ class EvaluatorResult(EvaluatorOutcome):
     case_result_id: str
     run_id: str
     created_at: AwareDatetime
+    retry_round: int = Field(default=0, ge=0)
     attempts: list[RunAttempt] = Field(default_factory=list)  # evaluator calls
 
     model_config = ConfigDict(extra="forbid", strict=False)  # rows come from JSON text
@@ -583,10 +601,21 @@ class WriteItem:
     """One result to persist in a batch: a case result (`key` = case_key) or an evaluator result
     (`key` = case_key of the case result it belongs to)."""
 
-    kind: Literal["case", "evaluator"]
+    kind: Literal["case", "evaluator", "evaluator_retry"]
     case_key: str
     outcome: CaseOutcome | EvaluatorOutcome
     attempts: Sequence[RunAttempt] = ()
+    # evaluator_retry: the round this outcome supersedes a failed result in (old round + 1)
+    retry_round: int | None = None
+
+
+@dataclass(frozen=True)
+class RetryEval:
+    """A failed evaluator result that `--retry-failed` will replace (its attempts stay)."""
+
+    evaluator_result_id: str
+    retry_round: int  # the round of the new try (the failed result's round + 1)
+    prior_attempts: int
 
 
 @dataclass(frozen=True)
@@ -601,6 +630,9 @@ class Unit:
     output: str | None = None
     retrieved: list[str] | None = None
     meta: dict[str, Any] | None = None
+    retry_round: int = 0  # a reopened case result: the round of this try
+    prior_attempts: int = 0  # attempts of earlier rounds (numbering continues after them)
+    retry_evals: Mapping[str, RetryEval] = field(default_factory=dict)  # by evaluator key
 
 
 @dataclass(frozen=True)

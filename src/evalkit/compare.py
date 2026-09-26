@@ -6,9 +6,11 @@ show a small difference. So:
 
 * **Comparable?** Anything that differs other than what you varied is a *confounder*, named:
   a different dataset content, a different evaluator key (judge model, rubric, prompt
-  fingerprint, parameters), a different scoring version. Confounded comparisons are refused unless
-  explicitly allowed, and then carry the confounders in the result. Execution-only differences
-  (`exec_hash`, environment) are informational.
+  fingerprint, parameters), a different scoring version, and an environment difference that can
+  change what is measured (the endpoint a model was served from, how unusable judge answers are
+  retried; see `envsnapshot`). Confounded comparisons are refused unless explicitly allowed, and
+  then carry the confounders in the result. Execution-only differences (`exec_hash`, timeouts,
+  versions of Python / SDKs / EvalKit, price tables) are informational.
 * **Paired by case.** Both runs are scored on the same cases, so between-case difficulty cancels.
   A case that is unscored on either side (any failure class, not applicable, missing) is excluded
   and counted per side and reason; a coverage gap of more than 5 points raises a survivorship
@@ -36,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from evalkit import stats
 from evalkit.analysis import DEFAULT_MIN_COVERAGE, metric_seed, summarize
+from evalkit.envsnapshot import environment_differences
 from evalkit.errors import RunError
 
 if TYPE_CHECKING:
@@ -213,6 +216,14 @@ def compare(
     for bk, bs in b_specs.items():
         if bk not in c_specs and not any(p[0] == bk for p in pairs):
             info.append(f"evaluator {bs.kind}:{bs.name} exists only in the baseline: not compared")
+    env_confounders, env_notes = environment_differences(
+        base.environment,
+        cand.environment,
+        [e["environment"] for e in store.list_executions(baseline_id)],
+        [e["environment"] for e in store.list_executions(candidate_id)],
+    )
+    confounders.extend(Confounder(kind, detail) for kind, detail in env_confounders)
+    info.extend(env_notes)
     if confounders and not allow_confounders:
         raise ComparisonError(
             "the runs are confounded, so a difference cannot be attributed to what you varied: "

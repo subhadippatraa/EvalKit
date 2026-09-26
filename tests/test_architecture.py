@@ -26,7 +26,11 @@ ALLOWED = {
     "judge_eval": {"errors", "failures", "judge", "llm", "models"},
     "datasets": {"errors", "hashing", "limits", "models", "safejson"},
     "runs": {"datasets", "errors", "evidence", "failures", "hashing", "limits", "models", "redact"},
-    "calls": {"failures", "llm", "runs"},
+    "pricing": {"errors", "hashing"},
+    "cache": {"hashing", "llm"},
+    "events": {"redact"},
+    "envsnapshot": {"hashing", "pricing"},
+    "calls": {"cache", "events", "failures", "llm", "pricing", "runs"},
     "targets": {"calls", "datasets", "errors", "failures", "limits", "llm", "runs"},
     "evaluators": {
         "calls",
@@ -44,7 +48,7 @@ ALLOWED = {
     "env": {"errors", "llm"},
     "runlock": {"errors"},
     "analysis": {"runs", "stats"},
-    "compare": {"analysis", "errors", "stats"},
+    "compare": {"analysis", "envsnapshot", "errors", "stats"},
     "calibration": {"errors", "limits", "stats"},
     "judgecheck": {
         "calls",
@@ -56,9 +60,10 @@ ALLOWED = {
         "runs",
         "safejson",
     },
-    "report": {"analysis", "calibration", "compare", "errors"},
+    "operations": {"analysis"},
+    "report": {"analysis", "calibration", "compare", "errors", "operations"},
 }
-STORES = {"dataset_store", "run_store", "analysis_store", "store", "migrations"}
+STORES = {"dataset_store", "run_store", "analysis_store", "ops_store", "store", "migrations"}
 ENGINE = {"engine"}
 INTERFACE = {"cli", "cli_platform", "kit", "__init__", "evaluator"}
 SDKS = {"boto3", "botocore", "openai"}
@@ -129,6 +134,7 @@ def test_the_pure_analysis_layer_never_touches_the_engine_stores_or_cli():
     forbidden = STORES | ENGINE | {"cli", "cli_platform", "kit", "evaluator"}
     for module in (
         "analysis",
+        "operations",
         "compare",
         "calibration",
         "report",

@@ -165,7 +165,12 @@ class AnalysisStoreMixin:
             rows = self._conn.execute(
                 "SELECT scope, provider, model, COUNT(*), SUM(outcome = 'failed'), SUM(n > 1), "
                 "SUM(COALESCE(input_tokens, 0)), SUM(COALESCE(output_tokens, 0)), "
-                "SUM(duration_ms) FROM ("
+                "SUM(duration_ms), SUM(cache_hit), SUM(cache_key IS NOT NULL), "
+                "COALESCE(SUM(cost_usd), 0), SUM(cost_usd IS NOT NULL), "
+                "SUM(cache_hit = 0 AND cost_usd IS NULL "
+                "AND (outcome = 'ok' OR input_tokens IS NOT NULL)), "
+                "SUM(cache_hit = 0 AND outcome = 'ok' AND input_tokens IS NULL), "
+                "SUM(retry_round > 0) FROM ("
                 "SELECT 'target' AS scope, a.* FROM attempts a "
                 "JOIN case_results r ON r.id = a.case_result_id WHERE r.run_id = ? "
                 "UNION ALL SELECT 'evaluator', a.* FROM attempts a "
@@ -173,8 +178,25 @@ class AnalysisStoreMixin:
                 "GROUP BY scope, provider, model ORDER BY scope, provider, model",
                 (run_id, run_id),
             ).fetchall()
-        keys = ("scope", "provider", "model", "attempts", "failed", "retries", "in", "out", "ms")
+        keys = (
+            "scope", "provider", "model", "attempts", "failed", "retries", "in", "out", "ms",
+            "cache_hits", "cache_lookups", "cost", "priced", "unpriced", "unknown_usage",
+            "retry_attempts",
+        )  # fmt: skip
         return [dict(zip(keys, r, strict=True)) for r in rows]
+
+    def price_versions(self, run_id: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT price_version FROM ("
+                "SELECT a.price_version FROM attempts a "
+                "JOIN case_results r ON r.id = a.case_result_id WHERE r.run_id = ?1 "
+                "UNION ALL SELECT a.price_version FROM attempts a "
+                "JOIN evaluator_results e ON e.id = a.evaluator_result_id WHERE e.run_id = ?1) "
+                "WHERE price_version IS NOT NULL ORDER BY 1",
+                (run_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def slice_stats(self, run_id: str) -> list[tuple[str, str, str, int, float]]:
         """(tag, evaluator_key, metric, n, mean) for every tag carried by scored cases."""

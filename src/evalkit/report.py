@@ -22,6 +22,7 @@ from evalkit.analysis import RunSummary, evalkit_version, summarize
 from evalkit.calibration import calibrate
 from evalkit.compare import Comparison, GateResult
 from evalkit.errors import RunError
+from evalkit.operations import run_status
 
 if TYPE_CHECKING:
     from evalkit.kit import EvalKit
@@ -139,7 +140,12 @@ def _overview(kit: EvalKit, run_id: str) -> str:
     run = kit.runs.get(run_id)
     tags = kit.store.run_tags(run_id)
     target = json.dumps(run.config.target.identity, sort_keys=True)[:300]
-    env = ", ".join(f"{k}={v}" for k, v in run.environment.items() if k != "preflight")
+    e = run.environment
+    env = ", ".join(
+        f"{k}={e[k]}"
+        for k in ("evalkit_version", "evalkit_commit", "python", "platform")
+        if e.get(k)
+    )
     stopped = f" {esc(run.stop_reason)}" if run.stop_reason else ""
     started = run.started_at.isoformat() if run.started_at else "—"
     finished = run.finished_at.isoformat() if run.finished_at else "—"
@@ -231,9 +237,11 @@ def _pass_rates(s: RunSummary) -> str:
 def _usage(s: RunSummary) -> str:
     u = s.usage
     if u.get("cost_usd_estimate") is not None:
+        versions = ", ".join(u.get("price_versions") or []) or "user-supplied prices"
         cost = (
-            f"estimated cost ${u['cost_usd_estimate']:.4f} from user-supplied prices "
-            f"({esc(u['unpriced_attempts'])} unpriced attempts): an ESTIMATE"
+            f"estimated cost ${u['cost_usd_estimate']:.4f} from {esc(versions)} "
+            f"({esc(u['unpriced_attempts'])} unpriced attempts"
+            f"{', partial' if not u.get('cost_complete', True) else ''}): an ESTIMATE"
         )
     else:
         cost = "cost not estimated (no price table)"
@@ -250,6 +258,156 @@ def _usage(s: RunSummary) -> str:
             f"mean {num(t['mean'])} over {esc(int(t['n']))} completed cases.</p>"
         )
     return f"{latency}<p>{text}</p>"
+
+
+def _endpoints(env: Mapping[str, Any]) -> str:
+    pairs = [f"{m}@{h}" for m, h in (env.get("endpoints") or {}).items() if h]
+    return esc(", ".join(pairs) or "—")
+
+
+def _dash(value: Any) -> str:
+    return "—" if value is None else esc(value)
+
+
+def _operations(kit: EvalKit, run_id: str) -> str:
+    """Calls, cache, retries, tokens, cost, duration, budget, executions and the reproducibility
+    snapshot -- everything an operator asks after "did it finish, and what did it cost"."""
+    st = run_status(kit, run_id)
+    run = kit.runs.get(run_id)
+    c, calls, cache, tok, cost = st["cases"], st["calls"], st["cache"], st["tokens"], st["cost"]
+    d, b, rf = st["duration"], st["budget"], st["retry_failed"]
+    usd = "unknown" if cost["usd_estimate"] is None else f"${cost['usd_estimate']:.4f}"
+    if cost["usd_estimate"] is not None and not cost["complete"]:
+        usd += " (partial)"
+    hit_rate = "—" if cache["hit_rate"] is None else pct(cache["hit_rate"])
+    cards = [
+        ("Provider calls", calls["provider_calls"]),
+        ("Retries", calls["retries"]),
+        ("Cache hits", f"{cache['hits']} ({hit_rate})"),
+        ("Tokens", tok["total"]),
+        ("Estimated cost", usd),
+        ("Execution time", "—" if d["execution_s"] is None else f"{d['execution_s']}s"),
+        ("Budget", b["state"]),
+    ]
+    card_html = "".join(
+        f"<div class=card><b>{esc(v)}</b><span>{esc(k)}</span></div>" for k, v in cards
+    )
+    notes = []
+    if cost["usd_estimate"] is None:
+        notes.append("Cost is unknown: no price table covers the models used, or the provider "
+                     "reported no token usage. Unknown is not zero.")  # fmt: skip
+    elif not cost["complete"]:
+        notes.append(f"Cost is partial: {cost['unpriced_attempts']} call(s) are unpriced and "
+                     f"{tok['unknown_usage_attempts']} reported no usage.")  # fmt: skip
+    if cost["price_versions"]:
+        notes.append("Prices: " + ", ".join(cost["price_versions"]) + ". Cost is an ESTIMATE.")
+    if b["state"] == "exhausted":
+        detail = f" ({b['detail']})" if b.get("detail") else ""
+        pending = c["pending"]
+        notes.append(
+            f"The budget was exhausted ({b['exhausted_by']}){detail}: the run is resumable "
+            f"with a larger budget; {pending} case(s) are pending."
+        )
+    banners = "".join(banner(esc(n)) for n in notes)
+    cov = table(
+        ["evaluator", "coverage", "scored", "failed", "skipped", "not applicable", "missing"],
+        [
+            [
+                esc(e["name"]), pct(e["coverage"]), esc(e["scored"]), esc(e["failed"]),
+                esc(e["skipped"]), esc(e["not_applicable"]), esc(e["missing"]),
+            ]
+            for e in st["evaluators"]
+        ],
+        {1, 2, 3, 4, 5, 6},
+    )  # fmt: skip
+    tf = ", ".join(f"{esc(k)}: {esc(v)}" for k, v in sorted(c["target_failures"].items())) or "none"
+    facts = [
+        ["Cases", f"{c['completed']} completed, {c['failed']} failed, {c['pending']} pending, "
+                  f"{c['missing']} without a result of {c['total']}"],
+        ["Case-stage failures by class", tf],
+        ["Cache", f"mode {esc(cache['mode'])}: {cache['lookups']} lookups, {cache['hits']} hits, "
+                  f"{cache['misses']} misses"],
+        [
+            "Retried with --retry-failed",
+            f"{rf['units_retried']} unit(s) in {rf['executions']} run(s); "
+            f"{rf['retry_attempts']} attempt(s) in retry rounds",
+        ],
+        ["Tokens", f"{tok['input']} in / {tok['output']} out; "
+                   f"{tok['unknown_usage_attempts']} call(s) reported no usage"],
+        ["Wall time", "—" if d["wall_s"] is None else f"{d['wall_s']:.1f}s"],
+    ]  # fmt: skip
+    limits = ", ".join(f"{k}={v}" for k, v in b["limits"].items()) or "none"
+    facts.append(["Budget limits", esc(limits)])
+    if b["limits"]:
+        facts.append(["Budget spent / remaining", esc(f"{b['spent']} / {b['remaining']}")])
+    executions = table(
+        ["#", "started", "retry", "run was", "outcome", "units", "seconds", "stop reason",
+         "cache", "endpoints"],
+        [
+            [
+                esc(e["seq"]), esc(e["started_at"]), "yes" if e["retry_failed"] else "no",
+                esc(e["status_before"]), _dash(e["outcome_status"]), _dash(e["units"]),
+                _dash(e["elapsed_s"]), _dash(e["stop_reason"]),
+                esc(e["environment"].get("cache_mode", "—")),
+                _endpoints(e["environment"]),
+            ]
+            for e in kit.store.list_executions(run_id)
+        ],
+        {0, 5, 6},
+    )  # fmt: skip
+    env = run.environment
+    repro = []
+    for label, value in (
+        ("EvalKit", f"{env.get('evalkit_version', '—')} {env.get('evalkit_commit') or ''}"),
+        ("Python", f"{env.get('python_implementation', '')} {env.get('python', '—')}"),
+        ("Platform / SQLite", f"{env.get('platform', '—')} / {env.get('sqlite', '—')}"),
+        ("SDKs", ", ".join(f"{k} {v}" for k, v in (env.get("sdk") or {}).items()) or "—"),
+        ("Dataset", json.dumps(env.get("dataset") or {}, sort_keys=True)),
+        ("Target", json.dumps(env.get("target") or {}, sort_keys=True)),
+        ("Scoring version", env.get("scoring_version", "—")),
+        ("Retry / timeouts", json.dumps(env.get("retry") or {}, sort_keys=True)),
+        ("Cache policy", json.dumps(env.get("cache") or {}, sort_keys=True)),
+        ("Pricing", json.dumps(env.get("pricing") or {}, sort_keys=True)),
+    ):
+        repro.append([esc(label), esc(str(value).strip())])
+    ev_rows = [
+        [
+            esc(e.get("name")),
+            esc(e.get("provider") or "—"),
+            esc(e.get("model") or "—"),
+            esc(e.get("temperature", "—")),
+            esc(e.get("max_tokens", "—")),
+            esc(e.get("prompt_version") or "—"),
+            esc(e.get("version")),
+            esc(e.get("scoring_version") or "—"),
+        ]
+        for e in env.get("evaluators") or []
+    ]  # fmt: skip
+    evaluator_table = (
+        "<h3>Evaluators as configured</h3>"
+        + table(
+            [
+                "evaluator",
+                "provider",
+                "model",
+                "temperature",
+                "max tokens",
+                "prompt version",
+                "kind version",
+                "scoring version",
+            ],
+            ev_rows,
+        )
+        if ev_rows
+        else ""
+    )
+    return (
+        f"<h2>Operations</h2><div class=cards>{card_html}</div>{banners}"
+        f"{table(['fact', 'value'], [[esc(k), v] for k, v in facts])}"
+        f"<h3>Evaluator coverage</h3>{cov}"
+        f"<h3>Executions</h3>{executions}"
+        f"<h3>Reproducibility snapshot</h3>{table(['what', 'value'], repro)}{evaluator_table}"
+    )
 
 
 def _summary(s: RunSummary) -> str:
@@ -635,6 +793,7 @@ def render_report(
     sections = [
         _overview(kit, run_id),
         _summary(summary),
+        _operations(kit, run_id),
         _failures(summary),
         _trust(kit, run_id, summary),
         _comparison(comparison, gate) if comparison is not None else "",

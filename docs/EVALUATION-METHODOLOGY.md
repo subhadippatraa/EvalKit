@@ -141,10 +141,11 @@ This is a floor, not a quality bar. **A run can succeed with 60% coverage; the g
   (budget, breaker, cancel) has processed an unbiased sample.
 - **Seeded statistics**: every interval is seeded; a report is byte-identical for the same rows and
   seed (tested across `PYTHONHASHSEED` values).
-- **What is not pinned**: a hosted LLM at temperature 0 is not deterministic; EvalKit records the run
-  environment (EvalKit, Python and SQLite versions, the request timeout) but not the provider region,
-  base URL, SDK versions or a git SHA. A rerun of the same identity gives a **noise floor**
-  (`compare` reports it when both runs are pinned); without one, a tolerance is a guess.
+- **What is not pinned**: a hosted LLM at temperature 0 is not deterministic, and the provider can
+  change a model behind an id. EvalKit records the environment (§13) but cannot pin the model's
+  behaviour; only the response cache (§10, `replay`) reproduces a judge's answers exactly. A rerun of
+  the same identity gives a **noise floor** (`compare` reports it when both runs are pinned); without
+  one, a tolerance is a guess.
 - **Policy settings that affect outcomes**: `retry.validation_retries` (a judge answer rejected by
   validation is retried once with the error fed back, so the *accepted* answer can be a second
   sample) and `on_missing` are execution policy (in `exec_hash`), not identity. Keep them equal across
@@ -209,5 +210,103 @@ A judge is an instrument with unknown error, not ground truth.
   therefore unmet. Treat judge scores as uncalibrated until `judge-check` and `calibrate` have been run
   against your judge.
 - The oversize-input heuristic (§7) and every provider's real throttling behaviour.
+- **Cost estimates and the cache have not met a live provider.** Token counts are whatever the
+  provider reports and the price table is yours; the estimate has never been reconciled with an
+  invoice. The budget's input-size bound (§11) is an assumption about tokenizers, checked only
+  against fakes.
 - Anything beyond one process, one local SQLite file, and the measured dataset sizes (see
   [`BENCHMARK.md`](BENCHMARK.md)).
+
+## 10. The response cache
+
+- **What a hit means.** The provider was not called; the *stored* validated response was used and is
+  re-validated by today's code. A hit is recorded as an attempt (`cache_hit = 1`, cost exactly 0.0, no
+  tokens). A run's tokens and cost are therefore what *this run* spent, and `usage.cache` says how much
+  of it was served from the cache.
+- **Identity.** The key is a hash of every request field (system, user, tool name / description /
+  schema, temperature, max_tokens, sample index, role), the provider, model, endpoint (region or host)
+  and a scope: the evaluator key (rubric, prompt version, scoring version) or the target's identity.
+  Any difference is a different entry, including an evaluator configuration change that leaves the
+  request text identical (deliberately conservative: it forgoes sharing to rule out crossing).
+- **What is cached.** Validated successes of *deterministic* requests only. A response that failed
+  validation is never cached, so a judge whose first answer is invalid re-pays that first call on a
+  rerun (the corrected retry hits). Target calls are cached only with `--cache-targets`: a target's
+  variability is what an evaluation measures, and caching it would flatter reruns and hide
+  regressions. Raw provider payloads kept as failure evidence are not cached.
+- **Replay.** `--cache replay` answers from the cache alone and never calls the provider; a miss stops
+  the run `partial(cache_miss)`. It is the honest reproduction of a judged run: same responses, same
+  scoring code.
+- **Cache and comparison.** A judge that is non-deterministic at temperature 0 gives different scores
+  on different live runs; a cached rerun repeats the first run's answers, so a cached rerun **understates
+  run-to-run noise**. Do not use one to measure the noise floor.
+- **Limits.** Entries are never evicted automatically (`evalkit cache clear`); the endpoint, not other
+  client settings, is in the key; a provider that changes a model behind a stable id is invisible to it.
+
+## 11. Cost and budgets
+
+- **Tokens are what the provider reported**, per attempt, including a paid response that then failed
+  validation. A provider that reports none leaves the attempt's usage `NULL` (*unknown*), counted in
+  `unknown_usage_attempts`.
+- **Cost is an estimate**: reported tokens x the run's price table (`policy.pricing`, versioned, frozen
+  with the run; the version is stored on every attempt). EvalKit ships no prices. An unpriced model is
+  *unknown*, not zero, and the run's cost is then labelled **partial** with the number of unpriced
+  attempts. A cache hit is exactly zero. A callable target has no price: its spend is not in the cost.
+- **Budgets are enforced before each call.** A call is admitted only if
+  `spent + reserved by calls in flight + this call's worst case` is within every limit, checked
+  atomically, so concurrent workers cannot overspend. The worst case is an *upper bound*: input tokens
+  <= the request's UTF-8 bytes + 64 (a token is at least a byte for byte-level tokenizers), output
+  tokens <= `max_tokens`. Consequences: the bound is conservative (the last few thousand tokens of a
+  budget go unused; a budget below one call's worst case runs nothing), so **set a judge's
+  `max_tokens` close to what its answers need** (the default is 4096); and a provider whose tokenizer
+  violates the assumption could still overshoot by the difference. Usage the provider did not report is
+  assumed to have been the worst case *within the execution*; across a resume only reported usage
+  carries over.
+- **Per run, not per execution** for tokens and USD: a resume counts what earlier executions spent, so
+  restarting cannot spend a budget twice. `max_calls` and `max_duration_s` are per execution (their P1
+  behaviour). A USD budget needs a price for every model the run pays for, else it is refused up front.
+- **Failed calls are counted at what the provider reported** (usually nothing): a request that timed out
+  may still have been billed, and EvalKit cannot know.
+- **Stopping.** A budget stop is `partial(budget)`: nothing is recorded as a failure, the refused units
+  stay pending, and a resume with a larger budget finishes them.
+
+## 12. Retrying failed results
+
+- **Who is retried.** A failed result is retried when its failure is retryable *and* another try can
+  differ: transport failures (`rate_limited`, `provider_unavailable`, `timeout`, `connection`), a
+  target timeout, and units cut short by a deadline or a budget. **Never**: `evaluator.invalid_output`
+  (already retried once with the validation error fed back; at temperature 0 a repeat reproduces it),
+  systemic failures (auth, bad configuration, quota, rejected request: fix, don't retry), input
+  failures, and target exceptions or contract violations. A `reuse` target's inherited failures are
+  retried at the source run, not the copy.
+- **What is repeated.** Only failed units. A successful case result, a successful evaluator result and
+  every successful provider call are never repeated (tested by counting provider calls per case across
+  interruptions and retries). A unit is retried at most `retry_failed_rounds` (3) times over the life
+  of the run, so repeated invocations cannot spend without bound.
+- **History.** The failed result is archived (`result_history`) before it is replaced; its attempts
+  stay on the same row with numbering continuing, each stamped with its `retry_round`. Scores and
+  coverage always describe the *current* results; `runs failures --history` and the report show what
+  was superseded.
+- **Effect on a finished run.** Retrying can move a `succeeded` run's scores (coverage rises, a metric's
+  mean moves). It is reopened, finished again, snapshotted again, and the change is recorded as an
+  execution. A comparison made before the retry described the earlier state.
+- **What it does not do.** It does not retry within one execution (a unit first failing in this
+  execution is retried by the next `--retry-failed`), and it cannot make a non-deterministic judge
+  agree with itself.
+
+## 13. The environment snapshot and comparison
+
+A run records what defines its measurement (dataset identity, target and judge provider / model /
+generation settings, evaluator, prompt and scoring versions, retry and timeout settings, cache and
+budget configuration, the price table) and, per execution, the runtime that made the calls (EvalKit
+version and commit, Python, platform, SDK versions, endpoints). No credentials, no prompts, no URLs
+beyond a host.
+
+`compare` treats a difference as a **confounder** (refused unless `--allow-confounders`, and a gate
+failure) only when it can change what is measured or how invalid answers are handled: a different
+**endpoint** (a different deployment can answer differently under the same model id) or a different
+**`validation_retries`**. It reports as information, not confounders: EvalKit / Python / SDK / SQLite
+versions and the commit (scoring changes are tracked by `scoring_version`, which is a confounder),
+price tables (cost estimates are not comparable), transport attempts, deadlines and timeouts (they show
+up as coverage). A run created before this snapshot existed, or a client that reports no endpoint, is
+*unknown*, never different.
+

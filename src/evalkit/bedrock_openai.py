@@ -7,6 +7,7 @@ adapter over it. Requires the `bedrock-openai` extra (`pip install evalkit[bedro
 """
 
 from typing import Any
+from urllib.parse import urlparse
 
 from openai import APIConnectionError as OpenAIAPIConnectionError
 from openai import APIError as OpenAIAPIError
@@ -91,6 +92,8 @@ class BedrockOpenAIClient:
     ):
         self.model = model
         self.timeout = timeout
+        # host only: never the credentials or path (part of the cache identity and environment)
+        self.endpoint: str | None = urlparse(base_url).hostname
         self._client = client or OpenAI(
             base_url=base_url,
             api_key=api_key,

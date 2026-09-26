@@ -324,7 +324,7 @@ def summarize(
         {"scope": f.scope, "class": f.failure_class, "kind": f.kind, "count": f.count}
         for f in kit.runs.failure_counts(run_id)
     ]
-    usage = _usage(store.attempt_stats(run_id), prices, total)
+    usage = _usage(store.attempt_stats(run_id), prices, total, store.price_versions(run_id))
     slices = _slices(store.slice_stats(run_id))
     return RunSummary(
         run_id=run_id,
@@ -348,26 +348,69 @@ def summarize(
     )
 
 
-def _usage(
-    rows: list[dict[str, Any]], prices: Mapping[str, tuple[float, float]] | None, cases: int
+def run_usage(
+    kit: EvalKit, run_id: str, *, prices: Mapping[str, tuple[float, float]] | None = None
 ) -> dict[str, Any]:
+    """Tokens, calls, cache use and estimated cost of a run, from its attempts (no metrics read)."""
+    total = kit.store.run_info(run_id)["case_count"]
+    return _usage(kit.store.attempt_stats(run_id), prices, total, kit.store.price_versions(run_id))
+
+
+def _usage(
+    rows: list[dict[str, Any]],
+    prices: Mapping[str, tuple[float, float]] | None,
+    cases: int,
+    price_versions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Tokens, calls, cache use and cost. Tokens are what providers reported. Cost is an ESTIMATE:
+    the sum of each attempt's stored cost (tokens x the run's versioned price table). An attempt
+    with no price, or whose provider reported no usage, is counted (`unpriced_attempts`,
+    `unknown_usage_attempts`) and makes the cost partial; it is never priced at zero. A cache hit is
+    exactly 0.0."""
     attempts = sum(r["attempts"] for r in rows)
     tin, tout = sum(r["in"] for r in rows), sum(r["out"] for r in rows)
+    hits = sum(r["cache_hits"] for r in rows)
+    lookups = sum(r["cache_lookups"] for r in rows)
+    stored_unpriced = sum(r["unpriced"] for r in rows)
+    unknown_usage = sum(r["unknown_usage"] for r in rows)
+    priced = sum(r["priced"] for r in rows)
     usage: dict[str, Any] = {
         "attempts": attempts,
+        "provider_calls": attempts - hits,
         "failed_attempts": sum(r["failed"] for r in rows),
         "retries": sum(r["retries"] for r in rows),
+        "retry_round_attempts": sum(r["retry_attempts"] for r in rows),
         "input_tokens": tin,
         "output_tokens": tout,
         "tokens_per_case": (tin + tout) / cases if cases else None,
+        "cache": {
+            "lookups": lookups,
+            "hits": hits,
+            "misses": lookups - hits,
+            "hit_rate": hits / lookups if lookups else None,
+        },
         "by_model": [
-            {k: r[k] for k in ("scope", "provider", "model", "attempts", "failed", "in", "out")}
+            {
+                **{
+                    k: r[k]
+                    for k in ("scope", "provider", "model", "attempts", "failed", "in", "out")
+                },
+                "cache_hits": r["cache_hits"],
+                "cost_usd": r["cost"] if r["priced"] else None,
+            }
             for r in rows
         ],
-        "cost_usd_estimate": None,
-        "unpriced_attempts": 0,
+        "price_versions": price_versions or [],
+        "cost_usd_estimate": (
+            sum(r["cost"] for r in rows) if priced and (stored_unpriced or unknown_usage) else None
+        )
+        if not (priced and not stored_unpriced and not unknown_usage)
+        else sum(r["cost"] for r in rows),
+        "cost_complete": bool(priced) and not stored_unpriced and not unknown_usage,
+        "unpriced_attempts": stored_unpriced,
+        "unknown_usage_attempts": unknown_usage,
     }
-    if prices is not None:
+    if prices is not None:  # a caller-supplied mapping (model id -> USD per million tokens)
         cost, unpriced = 0.0, 0
         for r in rows:
             price = prices.get(r["model"]) if r["model"] else None
@@ -379,7 +422,9 @@ def _usage(
             raise ValueError("prices must be finite")
         usage["cost_usd_estimate"] = cost
         usage["unpriced_attempts"] = unpriced
-        usage["cost_per_1k_cases_usd"] = cost / cases * 1000 if cases and not unpriced else None
+        usage["cost_complete"] = not unpriced
+    complete = usage["cost_complete"] and cases
+    usage["cost_per_1k_cases_usd"] = usage["cost_usd_estimate"] / cases * 1000 if complete else None
     return usage
 
 

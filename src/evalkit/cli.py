@@ -13,7 +13,7 @@ import sys
 from dataclasses import asdict
 from itertools import islice
 
-from evalkit import cli_platform, safejson
+from evalkit import cli_platform, events, safejson
 from evalkit.errors import EvalKitError
 from evalkit.evaluator import Evaluator
 from evalkit.failures import FailureClass
@@ -35,8 +35,32 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _ops_flags(p: argparse.ArgumentParser, *, execute: bool) -> None:
+    """Pricing, cache and budget options (at `create` they are frozen into the run's policy; at
+    `execute` they apply to that execution only)."""
+    p.add_argument("--pricing", metavar="FILE", help="price table (.toml/.json), versioned")
+    p.add_argument(
+        "--cache",
+        choices=["off", "readwrite", "replay"],
+        help="response cache: off (default), readwrite, or replay (never calls the provider)",
+    )
+    p.add_argument("--cache-targets", action="store_true", help="also cache model-target calls")
+    p.add_argument("--max-tokens", type=_positive_int, help="token budget for the whole run")
+    p.add_argument("--max-cost-usd", type=float, help="USD budget for the whole run (needs prices)")
+    p.add_argument("--max-calls", type=_positive_int, help="provider-call budget per execution")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evalkit", description="LLM-as-judge evaluation")
+    parser.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warning", "error"],
+        help="emit structured run events at this level (default: off; or EVALKIT_LOG_LEVEL)",
+    )
+    parser.add_argument(
+        "--log-format", choices=["json", "text"], help="event format (default json)"
+    )
+    parser.add_argument("--log-file", help="append events to this file (owner-only) not stderr")
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="evaluate one input file")
@@ -80,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--idempotency-key")
     create.add_argument("--target", metavar="PKG.MOD:FN", help="a callable target (trusted code)")
     create.add_argument("--fingerprint", help="declared identity of the callable (e.g. a git sha)")
+    _ops_flags(create, execute=False)
     for name, help_text in (
         ("execute", "execute a created run"),
         ("resume", "resume a stopped run"),
@@ -88,6 +113,14 @@ def _parser() -> argparse.ArgumentParser:
         ex.add_argument("id")
         ex.add_argument("--target", metavar="PKG.MOD:FN", help="the run's callable target")
         ex.add_argument("--fingerprint")
+        ex.add_argument(
+            "--retry-failed",
+            action="store_true",
+            help="also give failed units whose failure is retryable another try (a succeeded run "
+            "is reopened); nothing that succeeded is repeated",
+        )
+        ex.add_argument("--quiet", action="store_true", help="no status summary on stderr")
+        _ops_flags(ex, execute=True)
     rls = rsub.add_parser("list", help="list runs, newest first")
     rls.add_argument("--dataset", help="only runs of this dataset version")
     rls.add_argument("--status", choices=sorted(TRANSITIONS))
@@ -99,6 +132,12 @@ def _parser() -> argparse.ArgumentParser:
     rfail.add_argument("id")
     rfail.add_argument("--class", dest="failure_class", choices=[c.value for c in FailureClass])
     rfail.add_argument("--limit", type=_positive_int, default=100)
+    rfail.add_argument(
+        "--history", action="store_true", help="list superseded failures (retried units) instead"
+    )
+    rstat = rsub.add_parser("status", help="calls, cache, retries, tokens, cost, budget, coverage")
+    rstat.add_argument("id")
+    rstat.add_argument("--format", choices=["json", "text"], default="json")
     rver = rsub.add_parser("verify", help="recheck a run (exit 1 on mismatch)")
     rver.add_argument("id")
     rtag = rsub.add_parser("tag", help="tag a run (a baseline is `tag:main`)")
@@ -131,6 +170,14 @@ def _parser() -> argparse.ArgumentParser:
     rdis = rsub.add_parser("disagreements", help="cases where evaluators disagree")
     rdis.add_argument("id")
     rdis.add_argument("--tau", type=float, default=0.25)
+
+    cache = sub.add_parser("cache", help="the provider-response cache")
+    csub = cache.add_subparsers(dest="cache_command", required=True)
+    csub.add_parser("stats", help="entries, size and models in the cache")
+    cclear = csub.add_parser("clear", help="delete cached responses")
+    cclear.add_argument(
+        "--older-than-days", type=float, help="only entries older than this (default: all)"
+    )
 
     cmp_ = sub.add_parser(
         "compare", help="paired comparison with a baseline; gates set the exit code"
@@ -229,11 +276,31 @@ _PLATFORM = {
     "compare": cli_platform.compare_command,
     "report": cli_platform.report_command,
     "judge-check": cli_platform.judge_check_command,
+    "cache": cli_platform.cache_command,
 }
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    try:
+        if args.log_level or args.log_file:
+            events.configure_logging(
+                (args.log_level or "info").upper(),
+                args.log_format or os.environ.get("EVALKIT_LOG_FORMAT") or "json",
+                file=args.log_file,
+            )
+        else:
+            events.configure_from_env()
+    except (ValueError, OSError) as e:
+        print(f"error: cannot configure logging: {scrub(str(e))}", file=sys.stderr)
+        return 2
+    try:
+        return _run(args)
+    finally:
+        events.reset_logging()
+
+
+def _run(args: argparse.Namespace) -> int:
     try:
         if args.command == "run":
             payload = _read_input(args.input)

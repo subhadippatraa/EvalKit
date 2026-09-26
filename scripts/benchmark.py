@@ -24,7 +24,9 @@ from pathlib import Path
 from evalkit import EvalKit, EvaluatorSpec, Rubric
 from evalkit.compare import compare
 from evalkit.evaluators import llm_judge_spec
+from evalkit.failures import EvalFailure, FailureClass
 from evalkit.llm import LLMResponse, Usage
+from evalkit.operations import run_status
 from evalkit.report import render_report
 from evalkit.targets import CallableTarget, PrecomputedTarget
 
@@ -38,6 +40,24 @@ class Judge:
             stop_reason="tool_use",
             usage=Usage(200, 20),
         )
+
+
+class FlakyJudge(Judge):
+    """Like `Judge`, but every 50th call (2%) fails once with a retryable outage."""
+
+    provider, model = "fake", "bench"
+
+    def __init__(self):
+        self.n = 0
+        self.failed_units: set[str] = set()
+
+    def call(self, req):
+        self.n += 1
+        key = req.user
+        if self.n % 50 == 0 and key not in self.failed_units:
+            self.failed_units.add(key)
+            raise EvalFailure(FailureClass.INFRA, "provider_unavailable", "503")
+        return super().call(req)
 
 
 def rss_mb() -> float:
@@ -157,6 +177,75 @@ def main() -> None:
     result["report_200_cases"] = {"seconds": round(dt, 3), "bytes": len(page)}
     v, dt = timed(lambda: kit.runs.verify(run.id))
     result["verify_run"] = {"seconds": round(dt, 3), "ok": v.ok}
+
+    # ---- P2.1: cache, cost tracking, budgets, retry, observability ---------------------------
+    priced = {
+        "version": "bench-1",
+        "models": [
+            {"provider": "fake", "model": "bench", "input_per_mtok": 3.0, "output_per_mtok": 15.0}
+        ],
+    }
+    judge_only = [llm_judge_spec("quality", rubric, judge)]
+    p2 = {**policy, "pricing": priced, "cache": {"mode": "readwrite"}}
+    cold = kit.controller.create(
+        "bench", target=PrecomputedTarget(), evaluators=judge_only, policy=p2
+    )
+    rep_cold, dt = timed(lambda: kit.controller.execute(cold.id, clients=[judge]))
+    result["p2_cache_cold_priced_judge"] = {
+        "status": rep_cold.status,
+        "seconds": round(dt, 3),
+        "cases_per_s": round(n / dt),
+        "provider_calls": rep_cold.spend.calls,
+        "cost_usd_estimate": round(rep_cold.spend.cost_usd, 4),
+    }
+    warm = kit.controller.create(
+        "bench", target=PrecomputedTarget(), evaluators=judge_only, policy=p2
+    )
+    rep_warm, dt = timed(lambda: kit.controller.execute(warm.id, clients=[judge]))
+    result["p2_cache_warm_rerun"] = {
+        "status": rep_warm.status,
+        "seconds": round(dt, 3),
+        "cases_per_s": round(n / dt),
+        "provider_calls": rep_warm.spend.calls,
+        "cache_hits": rep_warm.spend.cache_hits,
+    }
+    uncached = kit.controller.create(
+        "bench",
+        target=PrecomputedTarget(),
+        evaluators=judge_only,
+        policy={**policy, "pricing": priced},
+    )
+    rep_plain, dt = timed(lambda: kit.controller.execute(uncached.id, clients=[judge]))
+    result["p2_priced_judge_no_cache"] = {
+        "seconds": round(dt, 3),
+        "cases_per_s": round(n / dt),
+        "provider_calls": rep_plain.spend.calls,
+    }
+    flaky = FlakyJudge()
+    fl = kit.controller.create(
+        "bench", target=PrecomputedTarget(), evaluators=[llm_judge_spec("quality", rubric, flaky)],
+        policy={**policy, "retry": {"max_attempts": 1, "base_s": 0.001, "cap_s": 0.002}},
+    )  # fmt: skip
+    rep_fl, dt = timed(lambda: kit.controller.execute(fl.id, clients=[flaky]))
+    failed = sum(v.get("failed", 0) for v in kit.runs.counts(fl.id).evaluator_results.values())
+    rep_retry, dt_retry = timed(
+        lambda: kit.controller.execute(fl.id, clients=[flaky], retry_failed=True)
+    )
+    result["p2_retry_failed"] = {
+        "first_pass_seconds": round(dt, 3),
+        "failed_after_first_pass": failed,
+        "retry_seconds": round(dt_retry, 3),
+        "retry_reopened_evaluators": rep_retry.retry["reopened_evaluators"],
+        "provider_calls_in_retry": rep_retry.spend.calls,
+        "failed_after_retry": sum(
+            v.get("failed", 0) for v in kit.runs.counts(fl.id).evaluator_results.values()
+        ),
+        "verify_ok": kit.runs.verify(fl.id).ok,
+    }
+    status, dt = timed(lambda: run_status(kit, cold.id))
+    result["p2_run_status"] = {"seconds": round(dt, 3), "tokens": status["tokens"]["total"]}
+    page, dt = timed(lambda: render_report(kit, cold.id, max_cases=200))
+    result["p2_report_with_operations"] = {"seconds": round(dt, 3), "bytes": len(page)}
 
     kit.close()
     size = sum(f.stat().st_size for f in tmp.glob("bench.db*"))

@@ -23,6 +23,7 @@ from evalkit.errors import EvalKitError, RubricError
 from evalkit.limits import MAX_LIST_LIMIT
 from evalkit.migrations import migrate
 from evalkit.models import EvaluationResult, Review, format_validation_error
+from evalkit.ops_store import OpsStoreMixin
 from evalkit.run_store import RunStoreMixin
 
 log = logging.getLogger("evalkit.store")
@@ -98,7 +99,7 @@ def _decode_cursor(cursor: str) -> tuple[str, int]:
     raise EvalKitError(f"invalid cursor {cursor!r}")
 
 
-class SQLiteStore(DatasetStoreMixin, RunStoreMixin, AnalysisStoreMixin):
+class SQLiteStore(DatasetStoreMixin, RunStoreMixin, AnalysisStoreMixin, OpsStoreMixin):
     """Every call is serialized through one connection and a lock, so a store may be shared
     across threads. Multiple processes may open the same file (WAL + a busy timeout); that is
     tolerated, not tuned for (ponytail: one lock for the whole store, per-thread connections if

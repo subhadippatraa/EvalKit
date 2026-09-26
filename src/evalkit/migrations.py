@@ -574,6 +574,156 @@ BEGIN SELECT RAISE(ABORT, 'only a complete case result carries output metadata')
 """
 
 
+# P2.1 production operations.
+#  * attempts: cache hit/key, estimated cost + the price-table version it came from, retry round.
+#  * case_results / evaluator_results: `retry_round`. A retryable *failed* result may be superseded
+#    exactly once per round: its failure is archived in `result_history` first (append-only), the
+#    row keeps its id (so every earlier attempt stays attached to it) and takes the new outcome.
+#    Nothing else about a result can change, and a successful result can never be superseded. The
+#    write-once triggers are replaced by ones that allow exactly that transition.
+#  * run_executions: one row per `execute` (its environment, budget, spend, outcome). A `succeeded`
+#    run can be reopened only by an execution that names its `finished_at` (`--retry-failed`).
+#  * llm_cache: content-addressed provider responses (validated successes only).
+OPERATIONS_SQL = """
+ALTER TABLE attempts ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0 CHECK (cache_hit IN (0, 1));
+ALTER TABLE attempts ADD COLUMN cache_key TEXT;
+ALTER TABLE attempts ADD COLUMN cost_usd REAL CHECK (cost_usd IS NULL OR cost_usd >= 0);
+ALTER TABLE attempts ADD COLUMN price_version TEXT;
+ALTER TABLE attempts ADD COLUMN retry_round INTEGER NOT NULL DEFAULT 0 CHECK (retry_round >= 0);
+ALTER TABLE case_results ADD COLUMN retry_round INTEGER NOT NULL DEFAULT 0
+  CHECK (retry_round >= 0);
+ALTER TABLE evaluator_results ADD COLUMN retry_round INTEGER NOT NULL DEFAULT 0
+  CHECK (retry_round >= 0);
+
+CREATE TABLE result_history (
+  id                  TEXT PRIMARY KEY,
+  run_id              TEXT NOT NULL REFERENCES runs(id),
+  scope               TEXT NOT NULL CHECK (scope IN ('case', 'evaluator')),
+  case_result_id      TEXT NOT NULL REFERENCES case_results(id),
+  evaluator_result_id TEXT REFERENCES evaluator_results(id),
+  evaluator_key       TEXT,
+  retry_round         INTEGER NOT NULL CHECK (retry_round >= 0),
+  failure_class       TEXT NOT NULL,
+  failure_kind        TEXT NOT NULL,
+  failure_message     TEXT NOT NULL,
+  retryable           INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+  started_at          TEXT,
+  finished_at         TEXT,
+  duration_ms         INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  superseded_at       TEXT NOT NULL,
+  CHECK (
+    (scope = 'case' AND evaluator_result_id IS NULL AND evaluator_key IS NULL)
+    OR (scope = 'evaluator' AND evaluator_result_id IS NOT NULL AND evaluator_key IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX ux_history_case ON result_history(case_result_id, retry_round)
+  WHERE scope = 'case';
+CREATE UNIQUE INDEX ux_history_evaluator ON result_history(evaluator_result_id, retry_round)
+  WHERE scope = 'evaluator';
+CREATE INDEX idx_history_run ON result_history(run_id, scope);
+CREATE TRIGGER result_history_insert BEFORE INSERT ON result_history
+WHEN COALESCE((SELECT status FROM runs WHERE id = NEW.run_id), '') <> 'running'
+BEGIN SELECT RAISE(ABORT, 'history is recorded on a running run'); END;
+CREATE TRIGGER result_history_no_update BEFORE UPDATE ON result_history
+BEGIN SELECT RAISE(ABORT, 'result history is append-only'); END;
+CREATE TRIGGER result_history_no_delete BEFORE DELETE ON result_history
+BEGIN SELECT RAISE(ABORT, 'result history is append-only'); END;
+
+CREATE TABLE run_executions (
+  id                  TEXT PRIMARY KEY,
+  run_id              TEXT NOT NULL REFERENCES runs(id),
+  seq                 INTEGER NOT NULL CHECK (seq >= 1),
+  started_at          TEXT NOT NULL,
+  finished_at         TEXT,
+  status_before       TEXT NOT NULL,
+  retry_failed        INTEGER NOT NULL CHECK (retry_failed IN (0, 1)),
+  reopens_finished_at TEXT,
+  reopened_cases      INTEGER NOT NULL DEFAULT 0 CHECK (reopened_cases >= 0),
+  reopened_evaluators INTEGER NOT NULL DEFAULT 0 CHECK (reopened_evaluators >= 0),
+  units               INTEGER,
+  elapsed_s           REAL,
+  outcome_status      TEXT,
+  stop_reason         TEXT,
+  budget_json         TEXT,
+  spend_json          TEXT,
+  environment_json    TEXT NOT NULL DEFAULT '{}',
+  UNIQUE (run_id, seq)
+);
+CREATE INDEX idx_run_executions_run ON run_executions(run_id, seq);
+CREATE TRIGGER run_executions_finish_once BEFORE UPDATE ON run_executions
+WHEN OLD.finished_at IS NOT NULL OR NEW.id IS NOT OLD.id OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.seq IS NOT OLD.seq OR NEW.started_at IS NOT OLD.started_at
+  OR NEW.status_before IS NOT OLD.status_before OR NEW.retry_failed IS NOT OLD.retry_failed
+  OR NEW.reopens_finished_at IS NOT OLD.reopens_finished_at
+  OR NEW.environment_json IS NOT OLD.environment_json
+BEGIN SELECT RAISE(ABORT, 'an execution record is finished once'); END;
+CREATE TRIGGER run_executions_no_delete BEFORE DELETE ON run_executions
+BEGIN SELECT RAISE(ABORT, 'execution records are permanent'); END;
+
+CREATE TABLE llm_cache (
+  key           TEXT PRIMARY KEY CHECK (length(key) = 64),
+  provider      TEXT NOT NULL,
+  model         TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  created_at    TEXT NOT NULL
+) WITHOUT ROWID;
+
+-- a succeeded run is reopened only by an execution that names the finished_at it reopens
+DROP TRIGGER runs_legal_transition;
+CREATE TRIGGER runs_legal_transition BEFORE UPDATE ON runs
+WHEN NOT (
+  (OLD.status = 'created' AND NEW.status = 'running')
+  OR (OLD.status = 'running' AND NEW.status IN ('succeeded','partial','cancelled','failed'))
+  OR (OLD.status IN ('partial','cancelled','failed') AND NEW.status = 'running')
+  OR (OLD.status = 'succeeded' AND NEW.status = 'running' AND EXISTS (
+        SELECT 1 FROM run_executions x
+        WHERE x.run_id = OLD.id AND x.reopens_finished_at = OLD.finished_at))
+)
+BEGIN SELECT RAISE(ABORT, 'illegal run status change'); END;
+
+-- a failed case result is reopened (pending again) only with its failure archived; every
+-- other change to a non-pending result is refused
+DROP TRIGGER case_results_write_once;
+CREATE TRIGGER case_results_write_once BEFORE UPDATE ON case_results
+WHEN NOT (
+    (OLD.status = 'pending' AND NEW.status <> 'pending' AND NEW.retry_round = OLD.retry_round)
+    OR (OLD.status = 'failed' AND NEW.status = 'pending'
+        AND NEW.retry_round = OLD.retry_round + 1
+        AND EXISTS (SELECT 1 FROM result_history h WHERE h.case_result_id = OLD.id
+                    AND h.scope = 'case' AND h.retry_round = OLD.retry_round))
+  )
+  OR NEW.id IS NOT OLD.id OR NEW.run_id IS NOT OLD.run_id OR NEW.case_id IS NOT OLD.case_id
+  OR NEW.created_at IS NOT OLD.created_at OR NEW.ord IS NOT OLD.ord
+  OR COALESCE((SELECT status FROM runs WHERE id = OLD.run_id), '') <> 'running'
+BEGIN SELECT RAISE(ABORT, 'case results are write-once, and only on a running run'); END;
+
+-- a failed evaluator result takes a new outcome, once per round, with its failure archived
+DROP TRIGGER evaluator_results_no_update;
+CREATE TRIGGER evaluator_results_no_update BEFORE UPDATE ON evaluator_results
+WHEN NOT (
+  OLD.status = 'failed' AND NEW.status IN ('ok','not_applicable','failed')
+  AND NEW.retry_round = OLD.retry_round + 1
+  AND NEW.id IS OLD.id AND NEW.case_result_id IS OLD.case_result_id AND NEW.run_id IS OLD.run_id
+  AND NEW.evaluator_key IS OLD.evaluator_key AND NEW.created_at IS OLD.created_at
+  AND EXISTS (SELECT 1 FROM result_history h WHERE h.evaluator_result_id = OLD.id
+              AND h.scope = 'evaluator' AND h.retry_round = OLD.retry_round)
+  AND COALESCE((SELECT status FROM runs WHERE id = OLD.run_id), '') = 'running'
+  AND COALESCE((SELECT status FROM case_results WHERE id = OLD.case_result_id), '') = 'complete'
+)
+BEGIN SELECT RAISE(ABORT, 'evaluator results are write-once'); END;
+
+-- the `skipped` rows of a reopened (pending) case result carry no evidence and may go
+DROP TRIGGER evaluator_results_no_delete;
+CREATE TRIGGER evaluator_results_no_delete BEFORE DELETE ON evaluator_results
+WHEN NOT (
+  OLD.status = 'skipped'
+  AND COALESCE((SELECT status FROM case_results WHERE id = OLD.case_result_id), '') = 'pending'
+  AND COALESCE((SELECT status FROM runs WHERE id = OLD.run_id), '') = 'running'
+)
+BEGIN SELECT RAISE(ABORT, 'evaluator results are permanent records'); END;
+"""
+
+
 def _backfill_input_hash(conn: sqlite3.Connection) -> None:
     """Record the input hash of every existing case. Cases are immutable, so the immutability
     trigger is lifted for exactly this statement and restored in the same transaction (a failure
@@ -660,6 +810,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(4, "runs_and_results", RUNS_SQL),
     Migration(5, "analysis_foundation", ANALYSIS_SQL),
     Migration(6, "p1_1_hardening", HARDENING_SQL, _backfill_input_hash),
+    Migration(7, "p2_1_operations", OPERATIONS_SQL),
 )
 
 _V1_EVALUATION_COLUMNS = frozenset(

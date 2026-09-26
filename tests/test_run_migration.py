@@ -43,6 +43,7 @@ def test_released_migrations_are_never_edited_and_this_one_is_pinned():
         "75809807771611ba08018eb50753cfdddfba91e4411c0af742e6dba5026bb613",  # 4 runs_and_results
         "55838dc14c3feac064f5406dff88e922cf17cf153edb7ce05d5c254d162eb5ed",  # 5 analysis
         "4017ccad2462e3df52d14970d901ae46117f609d54cd56ac20358a0b2d13d995",  # 6 p1_1_hardening
+        "eea0a364ee2ff18dc0460a43ef4dde352df1ce586671c0d3535659a91bab6180",  # 7 p2_1_operations
     ]
     assert [m.version for m in MIGRATIONS] == list(range(1, len(MIGRATIONS) + 1))
     assert MIGRATIONS[3].name == "runs_and_results"
@@ -64,12 +65,12 @@ def test_a_fresh_database_gets_the_run_schema(tmp_path):
     assert columns(path, "case_results") == {
         "id", "run_id", "case_id", "status", "output", "retrieved_json", "failure_class",
         "failure_kind", "failure_message", "retryable", "created_at", "started_at", "finished_at",
-        "duration_ms", "ord", "meta_json",
+        "duration_ms", "ord", "meta_json", "retry_round",
     }  # fmt: skip
     assert columns(path, "evaluator_results") == {
         "id", "case_result_id", "run_id", "evaluator_key", "status", "verdict", "detail_json",
         "failure_class", "failure_kind", "failure_message", "retryable", "created_at",
-        "duration_ms",
+        "duration_ms", "retry_round",
     }  # fmt: skip
     assert columns(path, "metrics") == {
         "evaluator_result_id",

@@ -599,13 +599,15 @@ class LLMJudgeEvaluator(_Evaluator):
             temperature=p["temperature"], timeout_s=call.timeout_s, max_tokens=p["max_tokens"],
         )  # fmt: skip
 
-        def send(feedback: str | None) -> Any:
-            req = (
+        def request(feedback: str | None) -> Any:
+            return (
                 base
                 if feedback is None
                 else replace(base, user=base.user + _FEEDBACK.format(error=feedback))
             )
-            return self.client.call(req)
+
+        def send(feedback: str | None) -> Any:
+            return self.client.call(request(feedback))
 
         def validate(resp: Any) -> Any:
             payload = judge_payload(resp)
@@ -627,6 +629,8 @@ class LLMJudgeEvaluator(_Evaluator):
             provider=self.client.provider,
             model=self.client.model,
             feedback_retry=True,
+            request=request,
+            endpoint=getattr(self.client, "endpoint", None),
         )
         metrics = {"score": overall}
         for c in self.rubric.criteria:

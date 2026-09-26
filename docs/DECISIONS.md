@@ -1,6 +1,6 @@
 # Decision records
 
-Decisions taken while building and hardening the platform, each with what was rejected and what it
+Decisions taken while building, hardening and operating the platform, each with what was rejected and what it
 costs. The original design decisions (D1-D16) are in
 [`TARGET-ARCHITECTURE.md`](TARGET-ARCHITECTURE.md) §16; the list of deviations from that design is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) ("P1 platform" and "P1.1 hardening"). Format: **Decision · Why ·
@@ -144,4 +144,129 @@ Rejected · Cost.**
   `SECURITY.md`.
 - **Analysis loads every case outcome into memory** (compare, calibrate, report); fine at the measured
   sizes, the first ceiling beyond them.
-- Everything listed under "Remaining P2 work" in the P1.1 section of `ARCHITECTURE.md`.
+- Everything listed under "Remaining P2 work" in `ARCHITECTURE.md` (superseded by the P2.1 list).
+
+## DR-15. Retry replaces a failed result in place, with its failure archived
+
+- **Decision.** `--retry-failed` gives a retryable failed result a new outcome *on the same row*, after
+  copying its failure into the append-only `result_history`. The write-once triggers are replaced by
+  ones that allow exactly that: `failed -> pending` (case) and `failed -> ok | not_applicable | failed`
+  (evaluator), the round advanced by one, the failure archived. A successful result never changes.
+- **Why.** Every earlier attempt (evidence, tokens, cost) stays attached to the row and numbering
+  continues; every analysis query keeps reading "the current result" with no generation column and no
+  join; `succeeded` and coverage stay defined as before.
+- **Rejected.** A new row per try with a "current" flag or generation (every aggregate and index would
+  change; the `UNIQUE(run, case)` constraints cannot be relaxed without rebuilding the biggest tables);
+  deleting the failed row (destroys history, and attempts reference it); a separate retry table that
+  analysis must merge.
+- **Cost.** Two triggers are more permissive than before; each has raw-SQL tests including forged
+  history rows, and `runs verify` checks that retry rounds match the archive. A retry changes a finished
+  run's numbers (methodology §12).
+
+## DR-16. A succeeded run is reopened only by a recorded execution
+
+- **Decision.** Retrying failures of a `succeeded` run (the usual case: P1.1 made a run with a few
+  failures `succeeded`) moves it `succeeded -> running -> succeeded`. The database allows that only when
+  a `run_executions` row names the run's current `finished_at`; the service-level state machine
+  (`RunService.transition`) still refuses it, and the existing table-driven tests of all 36 status pairs
+  are unchanged.
+- **Why.** Without it `--retry-failed` would not work on the runs that need it; with a plain trigger
+  relaxation, any writer could reopen a finished run.
+- **Rejected.** Making runs with retryable failures `partial` (changes P1.1's meaning of `succeeded`);
+  requiring a new run (loses history; a rerun with the cache is still available for judges).
+- **Cost.** A finished run can change after the fact; each change is a recorded execution and a new
+  summary snapshot.
+
+## DR-17. `evaluator.invalid_output` is never retried by `--retry-failed`
+
+- **Decision.** Eligible: retryable failures except `evaluator.invalid_output`, systemic kinds, and the
+  non-retryable rest; units cut short by a deadline or a budget are eligible although their kind is not
+  "retryable" in the in-unit sense. One rule (`failures.retry_eligible`), mirrored in SQL and tested equal
+  for every kind and flag.
+- **Why.** The in-unit retry already fed the validation error back; at temperature 0 a later identical
+  try reproduces the answer and spends money for nothing (design 8.5 says the same).
+- **Cost.** A judge that was merely unlucky twice stays failed; that is what coverage reports.
+
+## DR-18. Token and USD budgets are per run and enforced per call; `max_calls` stays per execution
+
+- **Decision.** A call is admitted only if its worst case fits every remaining limit, checked
+  atomically under the guard's lock, with what earlier executions spent counted. `max_calls` and
+  `max_duration_s` keep their P1 per-execution meaning.
+- **Why.** "Cannot overspend" needs the check *at the call*, not at unit dispatch; a per-run budget must
+  survive a resume. An existing test pins `max_calls` as per execution (a resume with the same budget
+  makes progress), and P1's documented semantics are preserved rather than silently changed.
+- **Rejected.** Checking at dispatch (overshoots by the window, as P1 did); a soft budget with a stated
+  overshoot; making every budget per run (would change P1 behaviour).
+- **Cost.** Conservative: the worst case counts input <= UTF-8 bytes + 64 and output = `max_tokens`, so a
+  budget below one call's worst case runs nothing and the tail of a budget goes unused. The bound is an
+  assumption about tokenizers, not a proof.
+
+## DR-19. A refused call leaves its unit pending, not failed
+
+- **Decision.** Budget refusal and a replay miss raise `UnitAbandoned`: nothing is recorded, the run
+  stops `partial(budget)` / `partial(cache_miss)`, and the resume finishes the unit. A free target's case
+  result is written together with its first evaluator result so the unit is wholly pending. A refusal
+  after a real attempt in the same call is recorded as `infrastructure.budget_exceeded` (evidence kept),
+  which `--retry-failed` retries.
+- **Why.** Results are write-once: a failure recorded because the budget ran out would make raising the
+  budget useless.
+
+## DR-20. The response cache is off by default and scoped
+
+- **Decision.** `cache.mode` defaults to `off`; the key covers every request field (minus `timeout_s`),
+  provider, model, endpoint and the evaluator/target scope; only validated, deterministic responses are
+  stored; targets only with `--cache-targets`; `replay` never calls the provider.
+- **Why.** A cache changes what a rerun measures (it repeats a judge's answers), so it must be a choice;
+  the design's judge-by-default would also have changed the call counts P1 tests pin. The scope is in
+  the key because "cache identity must include evaluator configuration": the request text usually
+  already differs, and when it does not, not sharing is the safe error.
+- **Rejected.** Caching final results; caching failures; caching targets by default; an LRU with a size
+  cap (a `cache clear` exists; `gc` is not built); a global lock around calls (a per-key lock only).
+- **Cost.** A rerun of an unchanged judge does not share entries between two evaluators that differ
+  only in scoring parameters; a judge whose first answer is invalid re-pays it on a rerun.
+
+## DR-21. No bundled price table; unknown is unknown
+
+- **Decision.** Prices are supplied (`--pricing`, `policy.pricing`), versioned, frozen into the run's
+  policy and stamped on each attempt. Unpriced and no-usage are `NULL`; cost totals say when they are
+  partial; a USD budget is refused unless every paid model is priced.
+- **Why.** EvalKit cannot verify a provider's prices from here; a packaged table would be a claim it
+  cannot back, and a stale one silently wrong. Zero-by-default would understate spend.
+- **Cost.** The operator maintains a small file.
+
+## DR-22. Paid responses that fail validation record their usage
+
+- **Decision.** The tokens and cost of a response that arrived but failed validation are recorded on the
+  failed attempt (and count against budgets).
+- **Why.** They were billed. Before, an invalid judge answer counted as zero tokens, so both reports and
+  budgets undercounted exactly the wasteful calls.
+
+## DR-23. Events carry an allow-list of fields and no content
+
+- **Decision.** `events.emit` drops any field not in `FIELDS` and any non-scalar value, scrubs and clips
+  strings, and identifies failures by class and kind, not message. There is no option to log content.
+  Nothing is emitted until a handler is configured (a `NullHandler` keeps a library quiet).
+- **Why.** Prompts, outputs and provider messages are sensitive and can contain secrets; the safest
+  interface is one that cannot accept them.
+- **Cost.** Debugging a specific failure needs the stored attempt evidence, not the log.
+
+## DR-24. What counts as an environment confounder
+
+- **Decision.** A different endpoint (region / host) or a different `validation_retries` blocks a
+  comparison (unless allowed); EvalKit / Python / SDK / SQLite versions, the commit, price tables,
+  transport attempts, deadlines and timeouts are informational; a run without a snapshot is unknown.
+- **Why.** Confounders are differences that can change scores or which cases are scored. Blocking on
+  every version bump would make every cross-release comparison need `--allow-confounders`; scoring
+  changes are already a confounder through `scoring_version`.
+- **Cost.** A bug fix that changes scores without a `scoring_version` bump is visible only as an
+  informational note.
+
+## DR-25. Executions are recorded; the run's snapshot is split in two
+
+- **Decision.** The frozen environment holds what defines the measurement; each `execute` writes a
+  `run_executions` row (environment incl. endpoints, cache mode, budget in force, spend, outcome,
+  retry counts). Duration, budget state and "which machine resumed this" come from there.
+- **Why.** Endpoints and runtime are known only when the clients exist (at execute), and a resume can
+  happen elsewhere; a frozen record cannot hold that.
+- **Cost.** One more table; an interrupted execution's row stays unfinished (shown as such).
+

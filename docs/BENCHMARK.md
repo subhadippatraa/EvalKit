@@ -1,6 +1,6 @@
 # Local benchmark
 
-> Re-measured after the P1.1 hardening (10K in this file's first table, 100K in the section at the end).
+> The first two tables are the P1.1 measurements. **P2.1 re-measured both sizes** (section "P2.1: production operations" below; raw output in [`benchmark-10k.json`](benchmark-10k.json) and [`benchmark-100k.json`](benchmark-100k.json), which now hold the P2.1 run).
 
 `scripts/benchmark.py` measures the platform in one process against one local SQLite file with a
 fake zero-latency judge and target: it measures **EvalKit's own overhead** (validation, hashing,
@@ -67,6 +67,54 @@ asserts it by the query plan and by SQLite's own instruction counter, not by wal
   compare holds a record per case for both runs (peak 450 MB for the whole 100K process). That is the
   first ceiling as datasets grow, and it is untested beyond 100K.
 - One run each, no warm-up, one laptop: an order of magnitude, not a benchmark suite.
+
+## P2.1: production operations
+
+Same machine and workload shape, one run each, re-measured after P2.1 (`scripts/benchmark.py`, which now
+also measures the P2.1 paths). The judge is a zero-latency fake that reports 200 input / 20 output
+tokens per call, so these numbers are EvalKit's own overhead.
+
+**Did P2.1 slow the P1 paths?** Slightly. Every call now reserves against the budget guard, records
+tokens / cost / cache columns, and checks whether an event is enabled:
+
+| Step | P1.1, 10K | P2.1, 10K | P1.1, 100K | P2.1, 100K |
+|---|---|---|---|---|
+| Execute, precomputed target, 4 evaluators | 1,298 cases/s | 1,179 cases/s | 731 cases/s | 675 cases/s |
+| Execute, callable target, 3 evaluators | 1,338 cases/s | 1,268 cases/s | 869 cases/s | 839 cases/s |
+| Aggregate (`summarize`) | 0.57 s | 0.6 s | 7.7 s | 8.212 s |
+| Report, 200 cases (now with the Operations section) | 0.82 s | 0.915 s | 10.9 s | 12.789 s |
+| `runs verify` | 0.31 s | 0.332 s | 4.9 s | 5.217 s |
+| Page through pending units | 0.11 s | 0.033 s | 0.42 s | 0.519 s |
+
+The execute figures are 5-9% below the P1.1 ones. One run each on a laptop cannot separate that from
+run-to-run variation, so read it as "no large regression", not as a measured cost of P2.1. Database size
+is larger (10K: 161.5 MB, 100K: 1,615 MB) mostly because this script now
+creates four more judge runs (with per-attempt cache and cost columns and cached responses) in the same file.
+
+**The new paths** (a single `llm_judge`, `pricing` and, where stated, `cache` on):
+
+| Step | 10K | 100K |
+|---|---|---|
+| Judge run, priced, cache **cold** (100% misses, every response written) | 1,445 cases/s | 1,100 cases/s |
+| Same run again, cache **warm** (100% hits, **0 provider calls**) | 1,650 cases/s (0 calls, 10,000 hits) | 1,225 cases/s (0 calls, 100,000 hits) |
+| Judge run, priced, no cache | 1,720 cases/s | 1,302 cases/s |
+| Injected 2% outage: first pass | 5.936 s, 200 failed | 77.487 s, 2,000 failed |
+| `--retry-failed` of those | 0.434 s, 200 calls, 0 failed left, verify ok | 6.583 s, 2,000 calls, 0 failed left, verify ok |
+| `run_status` (all operational numbers) | 0.042 s | 0.638 s |
+| Report with Operations section (1 evaluator) | 0.43 s | 6.171 s |
+
+What these do and do not show:
+
+- **The cache saves provider calls, not local time.** A warm rerun makes zero provider calls, but its
+  local cost (reading the entry, re-validating, writing the attempt and result rows) is close to a
+  cold run's: the saving is the provider's latency and bill, which a zero-latency fake does not have.
+- **Retry cost is proportional to what failed**, not to the run: 2,000 retried units of 100,000 took
+  6.583 s and exactly 2,000 provider calls (asserted equal to the failures).
+- **Cost tracking is exact arithmetic on the fake's reported tokens**: 90.0 USD
+  for 100,000 calls at 200 in / 20 out under the benchmark's example prices. It says nothing about a real
+  provider's bill.
+- Memory: peak resident memory of the whole 100K process is 453.6 MB (450 MB before), still
+  dominated by compare / report holding every case. Nothing was measured at 1M cases.
 
 ## What this does and does not say
 

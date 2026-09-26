@@ -38,6 +38,8 @@ from evalkit.evaluators import resolve
 from evalkit.judgecheck import BUILTIN_RUBRIC, builtin_cases, judge_check, load_cases
 from evalkit.kit import EvalKit
 from evalkit.limits import MAX_INPUT_FILE_BYTES
+from evalkit.operations import format_status, run_status
+from evalkit.pricing import PriceTable
 from evalkit.report import DEFAULT_MAX_CASES, write_report
 from evalkit.runs import EvaluatorSpec, Run
 from evalkit.targets import CallableTarget, ModelTarget, PrecomputedTarget, ReuseTarget, Target
@@ -177,9 +179,37 @@ def _clients(run: Run) -> list[Any]:
     return []
 
 
+def _ops_settings(args: argparse.Namespace, base: dict[str, Any]) -> dict[str, Any]:
+    """Pricing / cache / budget from the command line, merged over `base` (the spec file's policy
+    at `create`, the run's frozen policy at `execute`): a flag changes only what it names."""
+    out: dict[str, Any] = {}
+    if getattr(args, "pricing", None):
+        out["pricing"] = PriceTable.from_file(args.pricing).to_mapping()
+    cache = {}
+    if getattr(args, "cache", None):
+        cache["mode"] = args.cache
+    if getattr(args, "cache_targets", False):
+        cache["targets"] = True
+    if cache:
+        out["cache"] = {**(base.get("cache") or {}), **cache}
+    budget = {
+        k: v
+        for k, v in (
+            ("max_tokens", getattr(args, "max_tokens", None)),
+            ("max_cost_usd", getattr(args, "max_cost_usd", None)),
+            ("max_calls", getattr(args, "max_calls", None)),
+        )
+        if v is not None
+    }
+    if budget:
+        out["budget"] = {**(base.get("budget") or {}), **budget}
+    return out
+
+
 def _execute(kit: EvalKit, args: argparse.Namespace) -> tuple[int, Any]:
     run = kit.runs.get(args.id)
     target = _target_for_run(run, args)
+    overrides = _ops_settings(args, run.config.policy)
     token = CancelToken()
     previous = signal.getsignal(signal.SIGINT)
 
@@ -194,9 +224,19 @@ def _execute(kit: EvalKit, args: argparse.Namespace) -> tuple[int, Any]:
 
     signal.signal(signal.SIGINT, on_sigint)
     try:
-        report = kit.controller.execute(run.id, target=target, clients=_clients(run), token=token)
+        report = kit.controller.execute(
+            run.id,
+            target=target,
+            clients=_clients(run),
+            token=token,
+            overrides=overrides,
+            retry_failed=args.retry_failed,
+        )
     finally:
         signal.signal(signal.SIGINT, previous)
+    status = run_status(kit, run.id)
+    if not args.quiet:
+        print(format_status(status), file=sys.stderr)
     out = {
         "run": report.run.model_dump(mode="json"),
         "counts": asdict(report.counts),
@@ -207,7 +247,10 @@ def _execute(kit: EvalKit, args: argparse.Namespace) -> tuple[int, Any]:
         "elapsed_s": round(report.elapsed_s, 3),
         "units_per_s": round(report.units_per_s, 1),
         "spend": asdict(report.spend),
+        "run_spend": None if report.run_spend is None else asdict(report.run_spend),
+        "retry": report.retry,
         "spilled": report.spilled,
+        "operations": status,
     }
     return (0 if report.status == "succeeded" else 1), out
 
@@ -223,11 +266,13 @@ def runs_command(args: argparse.Namespace) -> tuple[int, Any]:
                 target = build_target(
                     spec.get("target", {}), callable_ref=args.target, fingerprint=args.fingerprint
                 )
+                policy = dict(spec.get("policy") or {})
+                policy.update(_ops_settings(args, policy))
                 run = kit.controller.create(
                     args.dataset,
                     target=target,
                     evaluators=_judge_specs(spec.get("evaluators", [])),
-                    policy=spec.get("policy"),
+                    policy=policy,
                     name=args.name,
                     idempotency_key=args.idempotency_key,
                 )
@@ -244,10 +289,26 @@ def runs_command(args: argparse.Namespace) -> tuple[int, Any]:
                     "counts": asdict(rs.counts(args.id)),
                     "failure_counts": [asdict(c) for c in rs.failure_counts(args.id)],
                     "tags": kit.store.run_tags(args.id),
-                }
+                    "retry": kit.store.retry_stats(args.id),
+                    "executions": [
+                        {k: e[k] for k in ("seq", "started_at", "finished_at", "retry_failed",
+                                           "status_before", "outcome_status", "stop_reason",
+                                           "units", "elapsed_s", "reopened_cases",
+                                           "reopened_evaluators")}
+                        for e in kit.store.list_executions(args.id)
+                    ],
+                }  # fmt: skip
                 if summary is not None:
                     out["summary"] = summary
                 return 0, out
+            case "status":
+                status = run_status(kit, args.id)
+                if args.format == "text":
+                    print(format_status(status))
+                    return 0, None
+                return 0, status
+            case "failures" if args.history:
+                return 0, kit.store.failure_history(args.id)
             case "failures":
                 found = rs.failures(args.id, failure_class=args.failure_class, limit=args.limit)
                 return 0, [
@@ -277,6 +338,24 @@ def runs_command(args: argparse.Namespace) -> tuple[int, Any]:
             case _:  # verify
                 report = rs.verify(args.id)
                 return (0 if report.ok else 1), asdict(report)
+    finally:
+        kit.close()
+
+
+def cache_command(args: argparse.Namespace) -> tuple[int, Any]:
+    """`evalkit cache stats | clear [--older-than-days N]`"""
+    from datetime import UTC, datetime, timedelta
+
+    kit = EvalKit.from_env()
+    try:
+        if args.cache_command == "stats":
+            return 0, kit.store.cache_stats()
+        cutoff = None
+        if args.older_than_days is not None:
+            if not 0 <= args.older_than_days < 36_500:
+                raise UsageError("--older-than-days must be between 0 and 36500")
+            cutoff = (datetime.now(UTC) - timedelta(days=args.older_than_days)).isoformat()
+        return 0, {"deleted": kit.store.cache_clear(cutoff)}
     finally:
         kit.close()
 
@@ -415,6 +494,7 @@ __all__ = [
     "DEFAULT_MAX_CASES",
     "EvalKitError",
     "build_target",
+    "cache_command",
     "compare_command",
     "judge_check_command",
     "load_callable",

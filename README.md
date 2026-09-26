@@ -292,7 +292,9 @@ params = { rubric = { criteria = [{ name = "correctness", description = "Is it c
 [policy]                       # execution only: never part of a run's identity
 concurrency = 4
 retry = { max_attempts = 4, base_s = 1.0, cap_s = 30.0, timeout_s = 60.0 }  # timeout_s: every provider request
-budget = { max_tokens = 2000000, max_calls = 50000, max_duration_s = 3600 }
+budget = { max_tokens = 2000000, max_cost_usd = 5.0, max_calls = 50000, max_duration_s = 3600 }
+cache = { mode = "readwrite" }   # off (default) | readwrite | replay; add targets = true for model targets
+pricing = { version = "2026-09", models = [{ provider = "bedrock", model = "my.judge", input_per_mtok = 3.0, output_per_mtok = 15.0 }] }
 systemic_threshold = 3         # stop only when auth / a rejected request repeats this many times
 min_coverage = 0.0             # a run whose evaluators scored less than this share does not "succeed"
 ```
@@ -398,16 +400,49 @@ cmp = compare(kit, baseline_run_id, run.id)
 gate = evaluate_gates(kit, run.id, Gates.from_file("gates.toml"), cmp)   # gate.exit_code
 ```
 
+### Production operations
+
+```bash
+# frozen into the run at creation (or per execution on execute/resume)
+evalkit runs create qa@latest --config spec.toml --pricing prices.toml \
+    --cache readwrite --max-tokens 2000000 --max-cost-usd 5
+evalkit --log-level info --log-file run-events.jsonl runs execute RUN   # structured events
+evalkit runs status RUN --format text     # cases, coverage, calls, retries, cache, tokens, cost, budget
+evalkit runs execute RUN --retry-failed   # only retryable failures; never repeats a success
+evalkit runs failures RUN --history       # what each retried unit failed with before
+evalkit runs resume RUN --max-cost-usd 10 # a stopped budget resumes with a larger one
+evalkit runs execute RUN2 --cache replay  # reproduce a judged run from the cache alone
+evalkit cache stats
+```
+
+- **Retry.** `--retry-failed` retries transport failures and units cut short by a deadline or budget,
+  never `evaluator.invalid_output`, systemic or non-retryable failures; a succeeded run is reopened for
+  it. The failed result is archived, its attempts kept, and a unit is retried at most 3 times.
+- **Cache.** Off unless asked. Keyed by every request field, provider, model, endpoint and the
+  evaluator scope; validated deterministic responses only. Hits are attempts with zero cost.
+- **Cost and budgets.** Tokens as reported by the provider; cost = tokens x *your* versioned price
+  table, unknown (never zero) when a model is unpriced or usage is missing. Budgets are checked before
+  every call against its worst case, across concurrent workers, and across resumes (tokens, USD).
+  A refused call leaves its unit pending; the run is `partial(budget)`.
+- **Events.** JSON lines with run id, case key, evaluator, attempt, duration, failure class and request
+  id; never prompts, outputs or provider messages. Off until `--log-level` / `EVALKIT_LOG_LEVEL`.
+- **Reports** gain an Operations section (coverage, calls, retries, cache, tokens, estimated cost,
+  duration, budget, executions, reproducibility snapshot). `compare` flags a different endpoint or
+  `validation_retries` as a confounder. Details: [`docs/EVALUATION-METHODOLOGY.md`](docs/EVALUATION-METHODOLOGY.md)
+  §10-§13; example prices: [`examples/pricing.example.toml`](examples/pricing.example.toml).
+
 ### Limitations
 
 - **One process, one SQLite file** on a local filesystem. Threads, not workers: no multi-process or
   multi-host execution, no leases. Measured numbers are in [`docs/BENCHMARK.md`](docs/BENCHMARK.md);
   nothing here claims distributed or 1M-case production scale.
-- **Not built** (P2): retrying *failed* results on resume (`--retry-failed`; terminal results are
-  write-once; only cases caught in a systemic stop are left pending), adaptive concurrency, per-provider limiter tables, the LLM response
-  cache, USD-priced budgets (budgets are tokens / calls / duration; cost is an estimate from
-  user-supplied prices), `evalkit gc`, samples-per-case self-consistency, run cancellation from another
-  process, structured logging/metrics export.
+- **Not built**: adaptive concurrency, per-provider limiter tables, `evalkit gc` and cache eviction
+  (there is `evalkit cache clear`), samples-per-case self-consistency, run cancellation from another
+  process, streaming analysis, metrics export. Retrying failures, the response cache, USD budgets,
+  structured events and the environment snapshot exist: see "Production operations".
+- **Cost is an estimate**, from a price table you supply (EvalKit ships none), reported token counts
+  and an input-size bound that assumes byte-level tokenizers; none of it has been reconciled with a
+  live invoice.
 - **Callable targets are trusted code** with full process privileges, are timed out but not killed
   (a timed-out function keeps running in its thread), and may be called twice for one case (a timeout
   is retried once): make them safe to call twice. There is no `http` target.
@@ -447,8 +482,10 @@ evalkit recover                          # save results a failed database write 
 evalkit review <id> --reviewer alice --verdict PASS [--score 0.9] [--comment "..."]
 
 evalkit dataset import|list|show|export|lint|verify ...        # versioned datasets
-evalkit runs create|execute|resume|list|show|failures|verify ... # runs (platform)
+evalkit runs create|execute|resume|list|show|status|failures|verify ... # runs (platform)
 evalkit runs tag|review|calibrate|queue|disagreements ...       # baselines, human calibration
+evalkit runs execute RUN --retry-failed                         # retry retryable failures only
+evalkit cache stats | clear [--older-than-days N]               # the provider-response cache
 evalkit compare CAND --baseline RUN|tag:NAME [--gates FILE] [--strict] [--allow-confounders]
 evalkit report RUN --out report.html [--compare BASELINE] [--gates FILE] [--max-cases N] [--force]
 evalkit judge-check [--run RUN [--evaluator NAME]] [--cases FILE] [--rubric FILE] [--name N] [--min-accuracy X]

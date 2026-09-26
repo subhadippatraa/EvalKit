@@ -1,0 +1,16 @@
+# An EXAMPLE price table. EvalKit ships no prices: these numbers are placeholders, not any provider's
+# real prices. Copy this file, fill in the prices you are actually charged, and give the table a
+# version label that changes whenever you change a number.
+#
+#   evalkit runs create qa@latest --config spec.toml --pricing prices.toml --max-cost-usd 5
+#
+# A model with no entry is "unpriced": its cost is reported as unknown, never as zero, and a USD
+# budget is refused for a run that pays for it.
+
+version = "2026-09-example"
+
+[[models]]
+provider = "bedrock"
+model = "example.judge-model-v1"
+input_per_mtok = 3.00     # USD per million input tokens
+output_per_mtok = 15.00   # USD per million output tokens

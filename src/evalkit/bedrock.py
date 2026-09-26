@@ -90,6 +90,12 @@ class BedrockClient:
             self._by_timeout[timeout] = client
         self._client = client
 
+    @property
+    def endpoint(self) -> str | None:
+        """The region requests go to (part of the cache identity and the run environment)."""
+        meta = getattr(self._client, "meta", None)
+        return getattr(meta, "region_name", None) or self._region
+
     def _build(self, timeout: float) -> Any:
         config = Config(
             retries={"total_max_attempts": 1, "mode": "standard"},  # no SDK retries

@@ -9,57 +9,93 @@
   "cases": 10000,
   "concurrency": 4,
   "import": {
-    "seconds": 0.301,
-    "cases_per_s": 33210
+    "seconds": 0.297,
+    "cases_per_s": 33686
   },
   "create_and_plan": {
-    "seconds": 0.486,
-    "cases_per_s": 20573
+    "seconds": 0.496,
+    "cases_per_s": 20152
   },
   "paging_pending_units": {
     "units": 10000,
     "pages": 40,
-    "seconds_total": 0.027,
-    "ms_per_page_first_third": 0.721,
-    "ms_per_page_last_third": 0.638,
-    "ms_per_page_max": 1.024
+    "seconds_total": 0.033,
+    "ms_per_page_first_third": 0.888,
+    "ms_per_page_last_third": 0.771,
+    "ms_per_page_max": 1.215
   },
   "execute_precomputed": {
     "status": "succeeded",
-    "seconds": 7.707,
-    "cases_per_s": 1298,
-    "result_rows_per_s": 6488,
+    "seconds": 8.483,
+    "cases_per_s": 1179,
+    "result_rows_per_s": 5894,
     "result_rows": 50000,
     "metric_rows": 50000
   },
   "execute_callable_target": {
     "status": "succeeded",
-    "seconds": 7.476,
-    "cases_per_s": 1338
+    "seconds": 7.889,
+    "cases_per_s": 1268
   },
   "recovery_scan_of_a_finished_run": {
     "seconds": 0.011
   },
   "aggregate": {
-    "seconds": 0.574,
+    "seconds": 0.6,
     "evaluators": 4
   },
   "compare_self": {
-    "seconds": 1.418,
+    "seconds": 1.462,
     "paired": 10000
   },
   "compare_two_runs": {
-    "seconds": 1.72,
+    "seconds": 1.775,
     "metrics": 4
   },
   "report_200_cases": {
-    "seconds": 0.818,
-    "bytes": 561017
+    "seconds": 0.915,
+    "bytes": 565604
   },
   "verify_run": {
-    "seconds": 0.312,
+    "seconds": 0.332,
     "ok": true
   },
-  "db_megabytes": 74.4,
-  "peak_rss_mb": 87.5
+  "p2_cache_cold_priced_judge": {
+    "status": "succeeded",
+    "seconds": 6.922,
+    "cases_per_s": 1445,
+    "provider_calls": 10000,
+    "cost_usd_estimate": 9.0
+  },
+  "p2_cache_warm_rerun": {
+    "status": "succeeded",
+    "seconds": 6.06,
+    "cases_per_s": 1650,
+    "provider_calls": 0,
+    "cache_hits": 10000
+  },
+  "p2_priced_judge_no_cache": {
+    "seconds": 5.814,
+    "cases_per_s": 1720,
+    "provider_calls": 10000
+  },
+  "p2_retry_failed": {
+    "first_pass_seconds": 5.936,
+    "failed_after_first_pass": 200,
+    "retry_seconds": 0.434,
+    "retry_reopened_evaluators": 200,
+    "provider_calls_in_retry": 200,
+    "failed_after_retry": 0,
+    "verify_ok": true
+  },
+  "p2_run_status": {
+    "seconds": 0.042,
+    "tokens": 2200000
+  },
+  "p2_report_with_operations": {
+    "seconds": 0.43,
+    "bytes": 290277
+  },
+  "db_megabytes": 161.5,
+  "peak_rss_mb": 88.3
 }

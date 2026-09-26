@@ -328,6 +328,8 @@ class ModelTarget:
             describe=describe_llm_response,
             provider=self.client.provider,
             model=self.client.model,
+            request=lambda _feedback: request,
+            endpoint=getattr(self.client, "endpoint", None),
         )
 
     def _output(self, resp: LLMResponse) -> TargetOutput:

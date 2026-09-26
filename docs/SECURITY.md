@@ -36,20 +36,29 @@ evaluated or used as a path.
 | SSRF | EvalKit never dereferences a URL from a dataset or an output; `json_schema` refuses remote `$ref` and never fetches; provider base URLs are operator config (`EVALKIT_JUDGE_BASE_URL`) | an operator-supplied base URL receives the API key |
 | Path traversal | only operator-supplied paths are opened (`--input`, `--out`, `EVALKIT_DB_PATH`); existing output files are not overwritten without `--force` | operator error |
 | Resource exhaustion | per-field, per-case, metadata, tag, criteria and import limits; bounded in-flight window and writer queue; token/call/duration budgets; a breaker | one valid 256 KB field is allowed |
-| Malicious dataset causing cost | preflight states the number of calls; budgets stop dispatch | there is no USD estimate or `--confirm-above` yet |
+| Malicious dataset causing cost | preflight states the number of calls; token, call, duration and **USD budgets are enforced before each call** (worst-case reservation, per run); a USD budget is refused unless every paid model is priced | the input bound assumes byte-level tokenizers; unreported usage is assumed worst-case only within an execution; there is no `--confirm-above` |
+| Secrets or content in logs | events accept only an allow-list of identifier and number fields (no prompt, output, reference, rubric or provider message field exists); strings are scrubbed and clipped; failures are logged by class and kind, never message; a test drives a full run and greps the log | `case_key` and run ids are logged (identifiers you chose); an application that attaches its own handler to `evalkit.events` sees the same restricted records |
+| Subprocess in environment capture | the only subprocess is `git rev-parse` (no shell, fixed arguments, 2 s timeout) run in EvalKit's own package directory, to record its commit; it reports nothing unless that directory is the `src/evalkit` of a git checkout | a hostile `git` on `PATH` (the operator's environment) |
+| A stale or poisoned cache entry | only validated successes are stored; a hit is re-validated by current code, and an entry that fails is deleted; a corrupt entry is a miss; the key includes provider, model, endpoint, every request field and the evaluator/target scope | the cache holds **model text in plaintext** in the database (same sensitivity as results); anyone who can write the file can plant an entry, like any other row |
 | Duplicate execution (double billing) | one executor per run: an OS advisory lock (`flock`) on `<db>.locks/<run>.lock`, released by the kernel when its holder dies | local filesystems only; not for network filesystems |
 
 ## Secrets and sensitive data
 
 - Secrets exist only in the process environment or the AWS credential chain. The run config is
   persisted through an allow-listed serializer that has no credential or header fields; the run
-  environment records EvalKit/Python/SQLite versions and the request timeout, not keys or URLs.
+  environment records versions (EvalKit, git commit, Python, SDKs, SQLite), the dataset identity, the
+  evaluator / generation / retry / cache / budget / pricing configuration and the **host** of a client's
+  base URL or its region, never keys, tokens, full URLs or credentials in a URL (a test sets secret
+  environment variables and asserts none reaches the database).
 - **Error text** is scrubbed before it is stored or printed: AWS ARNs and account ids, access-key ids,
   `sk-...` style keys, bearer tokens and `token=`/`password=`/`api-key` style values.
   **Judge reasoning, judged content and failed-attempt evidence are not scrubbed** (they are
   evidence). Failed attempts keep up to 64 KB of the rejected or partial provider output, which can
   contain the text that was sent. The SQLite file, the spill files and any HTML report therefore
   contain your prompts, outputs, references and judge reasoning **in plaintext**.
+- **The price table** is a plain file you author (no secrets); it is stored in the run's policy. The
+  response cache is part of the database and is covered by the same file permissions; `evalkit cache
+  clear` deletes it. Structured logs (`--log-file`) are created owner-only.
 - The database, backups (`<db>.bak-*`), spill files and reports are created owner-only (`0600`), lock
   and spill directories `0700`. Encryption at rest is delegated to the disk or volume. A backup file
   is briefly created with the process umask before it is restricted.
@@ -59,7 +68,9 @@ evaluated or used as a path.
 ## Integrity, not authenticity
 
 - Datasets, run configs, results, attempts and reviews are append-only, and this is enforced by
-  database triggers and CHECKs as well as Python; `evalkit dataset verify` and `evalkit runs verify`
+  database triggers and CHECKs as well as Python (a failed result can be superseded only with its
+  failure archived in an append-only history, and a succeeded run can be reopened only through a
+  recorded execution; a successful result can never change); `evalkit dataset verify` and `evalkit runs verify`
   recompute hashes and relationships to detect a writer that bypassed them. That detects accidental
   and naive tampering. **It is not a defence against a malicious local user**: anyone who can write the
   file can rewrite it consistently, drop the triggers, or delete it.

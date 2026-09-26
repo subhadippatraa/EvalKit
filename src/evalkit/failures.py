@@ -85,6 +85,25 @@ CASE_RESULT_CLASSES = frozenset({_C.INPUT, _C.TARGET, _C.INFRA})
 EVALUATOR_RESULT_CLASSES = frozenset({_C.INPUT, _C.EVALUATOR, _C.INFRA})
 
 
+# `--retry-failed` (resume with a second try for failed units). A failure is eligible when it says
+# it is retryable *and* another try can plausibly differ: an `evaluator.invalid_output` is retried
+# once in the unit with the validation error fed back, and at temperature 0 a later identical try
+# just reproduces it, so it is permanent. A deadline or a budget that cut a unit short is not the
+# unit's fault: it is retried though its kind is not "retryable" in the in-unit sense. Systemic
+# kinds (auth, bad config, quota) fail every case the same way and are fixed, not retried.
+RETRY_NEVER = frozenset({(_C.EVALUATOR, "invalid_output")})
+RETRY_ALSO = frozenset({(_C.INFRA, "deadline_exceeded"), (_C.INFRA, "budget_exceeded")})
+
+
+def retry_eligible(failure_class: FailureClass, kind: str, retryable: bool) -> bool:
+    key = (failure_class, kind)
+    if key in RETRY_ALSO:
+        return True
+    if key in RETRY_NEVER or check_kind(failure_class, kind).systemic:
+        return False
+    return bool(retryable)
+
+
 def check_kind(failure_class: FailureClass, kind: str) -> KindInfo:
     try:
         return KINDS[failure_class][kind]

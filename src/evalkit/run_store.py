@@ -18,7 +18,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from evalkit.errors import DuplicateResultError, RunError
-from evalkit.failures import Failure, FailureClass, check_kind
+from evalkit.failures import KINDS, RETRY_ALSO, RETRY_NEVER, Failure, FailureClass, check_kind
 from evalkit.models import format_validation_error
 from evalkit.runs import (
     TRANSITIONS,
@@ -28,6 +28,7 @@ from evalkit.runs import (
     EvaluatorResult,
     FailureCount,
     FailureRecord,
+    RetryEval,
     Run,
     RunAttempt,
     RunConfig,
@@ -47,8 +48,32 @@ _RUN_SELECT = (
 _ATTEMPT_COLUMNS = (
     "id, n, outcome, started_at, duration_ms, provider, model, error_class, error_kind, "
     "error_type, error, http_status, request_id, input_tokens, output_tokens, raw_payload, "
-    "raw_sha256, raw_truncated"
+    "raw_sha256, raw_truncated, cache_hit, cache_key, cost_usd, price_version, retry_round"
 )
+
+
+def _retry_predicate(alias: str, max_rounds: int) -> tuple[str, list[Any]]:
+    """SQL (and its parameters) selecting failed rows that `--retry-failed` may retry: fewer than
+    `max_rounds` earlier retries, and `evalkit.failures.retry_eligible` (kept in one place; this is
+    that function as a WHERE clause, cross-checked by a test)."""
+    also = sorted(f"{c.value}/{k}" for c, k in RETRY_ALSO)
+    blocked = sorted(
+        {f"{c.value}/{k}" for c, k in RETRY_NEVER}
+        | {
+            f"{c.value}/{k}"
+            for c, kinds in KINDS.items()
+            for k, info in kinds.items()
+            if info.systemic and (c, k) not in RETRY_ALSO
+        }
+    )
+    pair = f"({alias}.failure_class || '/' || {alias}.failure_kind)"
+    marks = lambda xs: ",".join("?" * len(xs))  # noqa: E731
+    sql = (
+        f"({alias}.retry_round < ? AND "
+        f"(({alias}.retryable = 1 AND {pair} NOT IN ({marks(blocked)})) "
+        f"OR {pair} IN ({marks(also)})))"
+    )
+    return sql, [max_rounds, *blocked, *also]
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -109,6 +134,7 @@ def _case_result_from(row: sqlite3.Row, attempts: list[RunAttempt]) -> CaseResul
             started_at=row["started_at"],
             finished_at=row["finished_at"],
             duration_ms=row["duration_ms"],
+            retry_round=row["retry_round"],
             attempts=attempts,
         )
     except (ValidationError, ValueError) as e:
@@ -136,6 +162,11 @@ def _attempt_from_row(row: sqlite3.Row) -> RunAttempt:
             raw=row["raw_payload"],
             raw_sha256=row["raw_sha256"],
             raw_truncated=bool(row["raw_truncated"]),
+            cache_hit=bool(row["cache_hit"]),
+            cache_key=row["cache_key"],
+            cost_usd=row["cost_usd"],
+            price_version=row["price_version"],
+            retry_round=row["retry_round"],
         )
     except (ValidationError, ValueError) as e:
         raise _corrupt(f"attempt {row['id']!r}", e) from e
@@ -326,8 +357,9 @@ class RunStoreMixin:
         conn.executemany(
             f"INSERT INTO attempts (id, {owner_column}, n, provider, model, started_at, "
             "duration_ms, outcome, error_class, error_kind, error_type, error, http_status, "
-            "request_id, input_tokens, output_tokens, raw_payload, raw_sha256, raw_truncated) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "request_id, input_tokens, output_tokens, raw_payload, raw_sha256, raw_truncated, "
+            "cache_hit, cache_key, cost_usd, price_version, retry_round) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 (
                     a.id,
@@ -349,6 +381,11 @@ class RunStoreMixin:
                     a.raw,
                     a.raw_sha256,
                     int(a.raw_truncated),
+                    int(a.cache_hit),
+                    a.cache_key,
+                    a.cost_usd,
+                    a.price_version,
+                    a.retry_round,
                 )
                 for a in attempts
             ],
@@ -518,6 +555,8 @@ class RunStoreMixin:
                         item.outcome,
                         item.attempts,  # type: ignore[arg-type]
                     )
+                elif item.kind == "evaluator_retry":
+                    self._replace_evaluator_result(conn, run_id, item)
                 else:
                     row = conn.execute(
                         "SELECT r.id FROM case_results r JOIN cases c ON c.id = r.case_id "
@@ -534,6 +573,188 @@ class RunStoreMixin:
                         item.outcome,
                         item.attempts,  # type: ignore[arg-type]
                     )
+
+    def _replace_evaluator_result(
+        self, conn: sqlite3.Connection, run_id: str, item: WriteItem
+    ) -> None:
+        """A retried evaluator: archive the failed result, then give the same row the new outcome.
+        Everything the failed try recorded (its attempts) stays attached to the row. Must be called
+        inside `_tx`. A row that is no longer the failed one this try replaces (another writer, or
+        a crash that stored it already) is a duplicate, never overwritten."""
+        outcome: EvaluatorOutcome = item.outcome  # type: ignore[assignment]
+        row = conn.execute(
+            "SELECT e.*, r.status AS case_status, r.id AS cr_id FROM evaluator_results e "
+            "JOIN case_results r ON r.id = e.case_result_id JOIN cases c ON c.id = r.case_id "
+            "JOIN runs x ON x.id = r.run_id AND c.dataset_version_id = x.dataset_version_id "
+            "WHERE r.run_id = ? AND c.case_key = ? AND e.evaluator_key = ?",
+            (run_id, item.case_key, outcome.evaluator_key),
+        ).fetchone()
+        if row is None:
+            raise RunError(f"case {item.case_key!r} has no result for {outcome.evaluator_key!r}")
+        new_round = row["retry_round"] + 1
+        if row["status"] != "failed" or (item.retry_round not in (None, new_round)):
+            raise DuplicateResultError(
+                f"the failed result of {outcome.evaluator_key!r} for case {item.case_key!r} was "
+                "already superseded; results are never overwritten"
+            )
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            "INSERT INTO result_history (id, run_id, scope, case_result_id, evaluator_result_id, "
+            "evaluator_key, retry_round, failure_class, failure_kind, failure_message, retryable, "
+            "duration_ms, finished_at, superseded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()), run_id, "evaluator", row["cr_id"], row["id"],
+                row["evaluator_key"], row["retry_round"], row["failure_class"],
+                row["failure_kind"], row["failure_message"], row["retryable"],
+                row["duration_ms"], row["created_at"], now,
+            ),
+        )  # fmt: skip
+        failure = outcome.failure
+        conn.execute(
+            "UPDATE evaluator_results SET status = ?, verdict = ?, detail_json = ?, "
+            "failure_class = ?, failure_kind = ?, failure_message = ?, retryable = ?, "
+            "duration_ms = ?, retry_round = ? WHERE id = ? AND status = 'failed'",
+            (
+                outcome.status, outcome.verdict, json.dumps(outcome.detail, allow_nan=False),
+                failure and failure.failure_class.value, failure and failure.kind,
+                failure and failure.message, failure and int(failure.retryable),
+                outcome.duration_ms, new_round, row["id"],
+            ),
+        )  # fmt: skip
+        conn.executemany(
+            "INSERT INTO metrics (evaluator_result_id, run_id, evaluator_key, name, value) "
+            "VALUES (?,?,?,?,?)",
+            [(row["id"], run_id, outcome.evaluator_key, n, v) for n, v in outcome.metrics.items()],
+        )
+        self._insert_attempts(conn, "evaluator_result_id", row["id"], item.attempts)  # type: ignore[arg-type]
+
+    # -- retrying failed results (`--retry-failed`) ---------------------------------------
+
+    def count_retryable(
+        self, run_id: str, max_rounds: int, *, cases: bool = True
+    ) -> tuple[int, int]:
+        """(failed case results, failed evaluator results) that a retry would pick up."""
+        case_sql, case_p = _retry_predicate("r", max_rounds)
+        ev_sql, ev_p = _retry_predicate("e", max_rounds)
+        with self._lock:
+            self._run_row(run_id)
+            n_case = 0
+            if cases:
+                n_case = self._conn.execute(
+                    "SELECT COUNT(*) FROM case_results r WHERE r.run_id = ? "
+                    f"AND r.status = 'failed' AND {case_sql}",
+                    (run_id, *case_p),
+                ).fetchone()[0]
+            n_ev = self._conn.execute(
+                "SELECT COUNT(*) FROM evaluator_results e JOIN case_results r "
+                "ON r.id = e.case_result_id WHERE e.run_id = ? AND e.status = 'failed' "
+                f"AND r.status = 'complete' AND {ev_sql}",
+                (run_id, *ev_p),
+            ).fetchone()[0]
+        return n_case, n_ev
+
+    def reopen_failed_cases(self, run_id: str, max_rounds: int, chunk: int = 500) -> int:
+        """Reopen (pending again) every retryable failed case result: its failure is archived in
+        `result_history` first, its `skipped` evaluator rows go, and its earlier attempts stay. In
+        chunks of one transaction each, so a crash leaves some reopened and the rest untouched,
+        each consistent. The run must be running."""
+        sql, params = _retry_predicate("r", max_rounds)
+        total = 0
+        while True:
+            with self._tx() as conn:
+                rows = conn.execute(
+                    "SELECT r.* FROM case_results r WHERE r.run_id = ? AND r.status = 'failed' "
+                    f"AND {sql} ORDER BY r.id LIMIT ?",
+                    (run_id, *params, chunk),
+                ).fetchall()
+                if not rows:
+                    return total
+                now = datetime.now(UTC).isoformat()
+                conn.executemany(
+                    "INSERT INTO result_history (id, run_id, scope, case_result_id, retry_round, "
+                    "failure_class, failure_kind, failure_message, retryable, started_at, "
+                    "finished_at, duration_ms, superseded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        (
+                            str(uuid.uuid4()), run_id, "case", r["id"], r["retry_round"],
+                            r["failure_class"], r["failure_kind"], r["failure_message"],
+                            r["retryable"], r["started_at"], r["finished_at"], r["duration_ms"],
+                            now,
+                        )
+                        for r in rows
+                    ],
+                )  # fmt: skip
+                ids = [r["id"] for r in rows]
+                marks = ",".join("?" * len(ids))
+                conn.execute(
+                    "UPDATE case_results SET status = 'pending', output = NULL, "
+                    "retrieved_json = NULL, meta_json = NULL, failure_class = NULL, "
+                    "failure_kind = NULL, failure_message = NULL, retryable = NULL, "
+                    "started_at = NULL, finished_at = NULL, duration_ms = NULL, "
+                    f"retry_round = retry_round + 1 WHERE status = 'failed' AND id IN ({marks})",
+                    ids,
+                )
+                conn.execute(
+                    f"DELETE FROM evaluator_results WHERE status = 'skipped' "
+                    f"AND case_result_id IN ({marks})",
+                    ids,
+                )
+                total += len(rows)
+
+    def retry_units(self, run_id: str, max_rounds: int) -> list[Unit]:
+        """Complete case results holding failed evaluator results a retry will replace, with what
+        the executor needs: the stored output and, per evaluator, the new round and the number of
+        attempts already made (numbering continues after them)."""
+        sql, params = _retry_predicate("e", max_rounds)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT r.id AS rid, r.output, r.retrieved_json, r.meta_json, c.case_key, "
+                "e.id AS eid, e.evaluator_key, e.retry_round, "
+                "(SELECT COUNT(*) FROM attempts a WHERE a.evaluator_result_id = e.id) AS prior "
+                "FROM evaluator_results e JOIN case_results r ON r.id = e.case_result_id "
+                "JOIN cases c ON c.id = r.case_id WHERE e.run_id = ? AND e.status = 'failed' "
+                f"AND r.status = 'complete' AND {sql} "
+                "ORDER BY COALESCE(r.ord, 0), r.id, e.evaluator_key",
+                (run_id, *params),
+            ).fetchall()
+        units: dict[str, tuple[sqlite3.Row, dict[str, RetryEval]]] = {}
+        for r in rows:
+            _, evals = units.setdefault(r["rid"], (r, {}))
+            evals[r["evaluator_key"]] = RetryEval(r["eid"], r["retry_round"] + 1, r["prior"])
+        return [
+            Unit(
+                rid, r["case_key"], "complete", r["output"],
+                None if r["retrieved_json"] is None else json.loads(r["retrieved_json"]),
+                None if r["meta_json"] is None else json.loads(r["meta_json"]),
+                retry_evals=evals,
+            )
+            for rid, (r, evals) in units.items()
+        ]  # fmt: skip
+
+    def failure_history(self, run_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        """Superseded failures, oldest first: what each retried unit failed with before."""
+        with self._lock:
+            self._run_row(run_id)
+            rows = self._conn.execute(
+                "SELECT h.scope, c.case_key, h.evaluator_key, h.retry_round, h.failure_class, "
+                "h.failure_kind, h.failure_message, h.retryable, h.superseded_at "
+                "FROM result_history h JOIN case_results r ON r.id = h.case_result_id "
+                "JOIN cases c ON c.id = r.case_id WHERE h.run_id = ? "
+                "ORDER BY h.superseded_at, c.case_key, h.evaluator_key LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def retry_stats(self, run_id: str) -> dict[str, int]:
+        with self._lock:
+            n_case, n_ev, units = self._conn.execute(
+                "SELECT COALESCE(SUM(scope = 'case'), 0), COALESCE(SUM(scope = 'evaluator'), 0), "
+                "COUNT(DISTINCT COALESCE(evaluator_result_id, case_result_id)) "
+                "FROM result_history WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return {"superseded_case_failures": n_case, "superseded_evaluator_failures": n_ev,
+                "units_retried": units}  # fmt: skip
 
     def pending_units(self, run_id: str, n_evaluators: int) -> list[Unit]:
         """Terminal case results still missing evaluator results (crash recovery): complete ones
@@ -575,13 +796,27 @@ class RunStoreMixin:
             where, params = " AND (r.ord, r.id) > (?, ?)", [after[0], after[1]]
         with self._lock:
             rows = self._conn.execute(
-                "SELECT r.id, r.ord AS o, c.case_key FROM case_results r "
-                "JOIN cases c ON c.id = r.case_id "
+                "SELECT r.id, r.ord AS o, c.case_key, r.retry_round AS rr, CASE WHEN "
+                "r.retry_round > 0 THEN (SELECT COUNT(*) FROM attempts a "
+                "WHERE a.case_result_id = r.id) ELSE 0 END AS prior "
+                "FROM case_results r JOIN cases c ON c.id = r.case_id "
                 f"WHERE r.run_id = ? AND r.status = 'pending'{where} "
                 "ORDER BY r.ord, r.id LIMIT ?",
                 (run_id, *params, limit),
             ).fetchall()
-        return [(r["o"], Unit(r["id"], r["case_key"], "pending")) for r in rows]
+        return [
+            (
+                r["o"],
+                Unit(
+                    r["id"],
+                    r["case_key"],
+                    "pending",
+                    retry_round=r["rr"],
+                    prior_attempts=r["prior"],
+                ),
+            )
+            for r in rows
+        ]
 
     def done_evaluator_keys(self, case_result_id: str) -> set[str]:
         with self._lock:
@@ -688,6 +923,7 @@ class RunStoreMixin:
                         failure=_failure_from(r),
                         duration_ms=r["duration_ms"],
                         created_at=r["created_at"],
+                        retry_round=r["retry_round"],
                         attempts=attempts.get(r["id"], []),
                     )
                 )
@@ -891,6 +1127,31 @@ class RunStoreMixin:
             ):
                 if n := count(sql, run_id):
                     problem(f"{n} result(s) have {label} attempts that are not numbered 1..k")
+            for label, sql in (
+                (
+                    "case",
+                    "SELECT COUNT(*) FROM case_results r WHERE r.run_id = ? AND r.retry_round <> "
+                    "(SELECT COUNT(*) FROM result_history h WHERE h.case_result_id = r.id "
+                    "AND h.scope = 'case')",
+                ),
+                (
+                    "evaluator",
+                    "SELECT COUNT(*) FROM evaluator_results e WHERE e.run_id = ? AND e.retry_round "
+                    "<> (SELECT COUNT(*) FROM result_history h WHERE h.evaluator_result_id = e.id)",
+                ),
+            ):
+                if n := count(sql, run_id):
+                    problem(
+                        f"{n} {label} result(s) have a retry round that does not match their "
+                        "archived failures"
+                    )
+            n = count(
+                "SELECT COUNT(*) FROM result_history h JOIN case_results r "
+                "ON r.id = h.case_result_id WHERE h.run_id = ? AND r.run_id <> h.run_id",
+                run_id,
+            )
+            if n:
+                problem(f"{n} history row(s) belong to another run's result")
             for scope, table in (("case", "case_results"), ("evaluator", "evaluator_results")):
                 for cls, kind in q(
                     f"SELECT DISTINCT failure_class, failure_kind FROM {table} "
