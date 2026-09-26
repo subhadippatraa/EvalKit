@@ -102,6 +102,28 @@ def main() -> None:
     )
     result["create_and_plan"] = {"seconds": round(dt, 3), "cases_per_s": round(n / dt)}
 
+    # paging the pending units: every page must cost the same (audit P1-14: it used to sort all the
+    # remaining pending rows per page, i.e. quadratic over the run)
+    kit.runs.start(run.id)
+    page_times, after, seen = [], None, 0
+    t_all = time.perf_counter()
+    while True:
+        t = time.perf_counter()
+        page = kit.store.next_pending(run.id, after, 256)
+        page_times.append(time.perf_counter() - t)
+        seen += len(page)
+        if len(page) < 256:
+            break
+        after = (page[-1][0], page[-1][1].result_id)
+    thirds = max(1, len(page_times) // 3)
+    result["paging_pending_units"] = {
+        "units": seen,
+        "pages": len(page_times),
+        "seconds_total": round(time.perf_counter() - t_all, 3),
+        "ms_per_page_first_third": round(1000 * sum(page_times[:thirds]) / thirds, 3),
+        "ms_per_page_last_third": round(1000 * sum(page_times[-thirds:]) / thirds, 3),
+        "ms_per_page_max": round(1000 * max(page_times), 3),
+    }
     report, dt = timed(lambda: kit.controller.execute(run.id, clients=[judge]))
     rows = n + n * len(evaluators)
     metrics = kit.store._conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0]
@@ -123,6 +145,8 @@ def main() -> None:
         "cases_per_s": round(n / dt),
     }
 
+    _, dt = timed(lambda: kit.store.pending_units(run.id, len(evaluators)))
+    result["recovery_scan_of_a_finished_run"] = {"seconds": round(dt, 3)}
     summary, dt = timed(lambda: kit.summarize(run.id))
     result["aggregate"] = {"seconds": round(dt, 3), "evaluators": len(summary.evaluators)}
     cmp, dt = timed(lambda: compare(kit, run2.id, run2.id))

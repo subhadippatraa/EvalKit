@@ -1,0 +1,65 @@
+{
+  "machine": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "processor": "arm",
+    "cpus": 8,
+    "python": "3.12.14",
+    "sqlite": "3.53.1"
+  },
+  "cases": 100000,
+  "concurrency": 4,
+  "import": {
+    "seconds": 3.801,
+    "cases_per_s": 26306
+  },
+  "create_and_plan": {
+    "seconds": 5.734,
+    "cases_per_s": 17441
+  },
+  "paging_pending_units": {
+    "units": 100000,
+    "pages": 391,
+    "seconds_total": 0.422,
+    "ms_per_page_first_third": 1.083,
+    "ms_per_page_last_third": 1.075,
+    "ms_per_page_max": 1.736
+  },
+  "execute_precomputed": {
+    "status": "succeeded",
+    "seconds": 136.85,
+    "cases_per_s": 731,
+    "result_rows_per_s": 3654,
+    "result_rows": 500000,
+    "metric_rows": 500000
+  },
+  "execute_callable_target": {
+    "status": "succeeded",
+    "seconds": 115.09,
+    "cases_per_s": 869
+  },
+  "recovery_scan_of_a_finished_run": {
+    "seconds": 0.187
+  },
+  "aggregate": {
+    "seconds": 7.707,
+    "evaluators": 4
+  },
+  "compare_self": {
+    "seconds": 21.095,
+    "paired": 100000
+  },
+  "compare_two_runs": {
+    "seconds": 25.059,
+    "metrics": 4
+  },
+  "report_200_cases": {
+    "seconds": 10.884,
+    "bytes": 561064
+  },
+  "verify_run": {
+    "seconds": 4.885,
+    "ok": true
+  },
+  "db_megabytes": 745.2,
+  "peak_rss_mb": 449.8
+}

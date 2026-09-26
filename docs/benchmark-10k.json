@@ -9,46 +9,57 @@
   "cases": 10000,
   "concurrency": 4,
   "import": {
-    "seconds": 0.252,
-    "cases_per_s": 39639
+    "seconds": 0.301,
+    "cases_per_s": 33210
   },
   "create_and_plan": {
-    "seconds": 0.478,
-    "cases_per_s": 20904
+    "seconds": 0.486,
+    "cases_per_s": 20573
+  },
+  "paging_pending_units": {
+    "units": 10000,
+    "pages": 40,
+    "seconds_total": 0.027,
+    "ms_per_page_first_third": 0.721,
+    "ms_per_page_last_third": 0.638,
+    "ms_per_page_max": 1.024
   },
   "execute_precomputed": {
     "status": "succeeded",
-    "seconds": 7.79,
-    "cases_per_s": 1284,
-    "result_rows_per_s": 6418,
+    "seconds": 7.707,
+    "cases_per_s": 1298,
+    "result_rows_per_s": 6488,
     "result_rows": 50000,
     "metric_rows": 50000
   },
   "execute_callable_target": {
     "status": "succeeded",
-    "seconds": 7.536,
-    "cases_per_s": 1327
+    "seconds": 7.476,
+    "cases_per_s": 1338
+  },
+  "recovery_scan_of_a_finished_run": {
+    "seconds": 0.011
   },
   "aggregate": {
-    "seconds": 0.556,
+    "seconds": 0.574,
     "evaluators": 4
   },
   "compare_self": {
-    "seconds": 1.354,
+    "seconds": 1.418,
     "paired": 10000
   },
   "compare_two_runs": {
-    "seconds": 1.653,
+    "seconds": 1.72,
     "metrics": 4
   },
   "report_200_cases": {
-    "seconds": 0.794,
-    "bytes": 560910
+    "seconds": 0.818,
+    "bytes": 561017
   },
   "verify_run": {
-    "seconds": 0.303,
+    "seconds": 0.312,
     "ok": true
   },
-  "db_megabytes": 73.8,
-  "peak_rss_mb": 86.5
+  "db_megabytes": 74.4,
+  "peak_rss_mb": 87.5
 }

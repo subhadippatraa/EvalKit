@@ -563,16 +563,22 @@ class RunStoreMixin:
     def next_pending(
         self, run_id: str, after: tuple[int, str] | None, limit: int
     ) -> list[tuple[int, Unit]]:
-        """Pending case results in processing order, keyset-paged after `(ord, id)`."""
+        """Pending case results in processing order, keyset-paged after `(ord, id)`.
+
+        The predicate and the ORDER BY are exactly the columns of `idx_case_results_claim (run_id,
+        status, ord, id)`, so a page is an index range scan: the cost of a page does not depend on
+        how many pending rows remain. (An expression such as COALESCE(ord, 0) here defeats the
+        index and turns a run into a quadratic sort; migration 6 guarantees a pending row has an
+        `ord`, so none is needed.)"""
         where, params = "", []
         if after is not None:
-            where, params = " AND (COALESCE(r.ord, 0), r.id) > (?, ?)", [after[0], after[1]]
+            where, params = " AND (r.ord, r.id) > (?, ?)", [after[0], after[1]]
         with self._lock:
             rows = self._conn.execute(
-                "SELECT r.id, COALESCE(r.ord, 0) AS o, c.case_key FROM case_results r "
+                "SELECT r.id, r.ord AS o, c.case_key FROM case_results r "
                 "JOIN cases c ON c.id = r.case_id "
                 f"WHERE r.run_id = ? AND r.status = 'pending'{where} "
-                "ORDER BY COALESCE(r.ord, 0), r.id LIMIT ?",
+                "ORDER BY r.ord, r.id LIMIT ?",
                 (run_id, *params, limit),
             ).fetchall()
         return [(r["o"], Unit(r["id"], r["case_key"], "pending")) for r in rows]
