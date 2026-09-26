@@ -262,6 +262,7 @@ def _summary(s: RunSummary) -> str:
         ("Pending / missing", st["pending"] + st["missing"]),
         ("Case coverage", pct(s.case_coverage)),
         ("Target failure rate", pct(s.target_failure_rate)),
+        ("Truncated outputs", s.truncated_outputs),
     ]
     card_html = "".join(
         f"<div class=card><b>{esc(v)}</b><span>{esc(k)}</span></div>" for k, v in cards
@@ -269,6 +270,15 @@ def _summary(s: RunSummary) -> str:
     banners = "".join(banner(esc(w)) for w in s.warnings)
     headers = ["evaluator", "metric", "value", "observed mean", "95% CI", "n", "coverage"]
     metrics = table(headers, _metric_rows(s), {2, 3, 5})
+    na_rows = [
+        [esc(ev.key), pct(ev.not_applicable_share)]
+        for ev in s.evaluators.values()
+        if ev.not_applicable_share > 0
+    ]
+    if na_rows:
+        metrics += "<h3>Not applicable</h3>" + table(
+            ["evaluator", "share of cases not applicable"], na_rows, {1}
+        )
     slices = ""
     if s.slices:
         rows = [
@@ -437,6 +447,25 @@ def _comparison(c: Comparison, g: GateResult | None) -> str:
             "<h3>Cases excluded from pairing</h3>"
             + table(["side", "reason", "cases"], excluded, {2})
         )
+    unpaired = [[esc(k), esc(n)] for k, n in c.unpaired.items() if n]
+    if unpaired:
+        out.append(
+            "<h3>Cases not paired</h3>"
+            + table(["reason", "cases"], unpaired, {1})
+            + "<p class=small>Cases are paired by key and by their input (prompt, context, "
+            "reference, relevance): the outputs are what is being compared.</p>"
+        )
+    na = [
+        [esc(side), esc(key), pct(share)]
+        for side, shares in c.not_applicable.items()
+        for key, share in shares.items()
+        if share > 0
+    ]
+    if na:
+        out.append(
+            "<h3>Not-applicable share of the paired cases</h3>"
+            + table(["side", "evaluator", "share"], na, {2})
+        )
     if c.noise_floor:
         rows = [[esc(k), num(v)] for k, v in c.noise_floor.items()]
         out.append(
@@ -521,6 +550,8 @@ def _case_block(kit: EvalKit, run_id: str, version_id: str, index: int, key: str
     kind = {"failed": "bad", "complete": "ok"}.get(cr.status, "warn")
     flagged = cr.status == "failed" or any(e.status == "failed" for e in results)
     marks = badge(cr.status, kind) + (" " + badge("has failures", "bad") if flagged else "")
+    if cr.meta and cr.meta.get("truncated"):
+        marks += " " + badge("truncated output", "warn")
     parts = [
         f"<summary><code>{esc(key)}</code> {marks}</summary>",
         "<h3>Input</h3>" + pre(case.prompt),

@@ -58,6 +58,9 @@ class EvalInput:
     context: str | None = None
     relevance: dict[str, int] | None = None
     retrieved: list[str] | None = None  # what the target retrieved, in rank order
+    # what the target reported about this output: {"stop_reason", "truncated", ...} or None. It is
+    # data for evaluators, never part of a judge's prompt (provenance must not reach the judge).
+    target_meta: dict[str, Any] | None = None
 
 
 class NotApplicable(Exception):

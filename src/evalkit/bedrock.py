@@ -4,6 +4,7 @@
 classified per design 7.4). `BedrockJudge` is the legacy `Judge` adapter over it.
 """
 
+import threading
 from typing import Any
 
 import boto3
@@ -70,6 +71,7 @@ def _retry_after(response: dict[str, Any]) -> float | None:
 
 class BedrockClient:
     provider = "bedrock"
+    _lock = threading.Lock()  # guards building per-timeout clients (rare, cheap)
 
     def __init__(
         self,
@@ -80,17 +82,35 @@ class BedrockClient:
     ):
         self.model = model
         self.timeout = timeout
+        self._region = region
+        self._injected = client is not None  # a caller-supplied client is used as is
+        self._by_timeout: dict[float, Any] = {}
         if client is None:
-            config = Config(
-                retries={"total_max_attempts": 1, "mode": "standard"},  # no SDK retries
-                connect_timeout=timeout,
-                read_timeout=timeout,
-            )
-            try:
-                client = boto3.client("bedrock-runtime", region_name=region, config=config)
-            except BotoCoreError as e:
-                raise ConfigError(f"cannot create Bedrock client: {e}") from e
+            client = self._build(timeout)
+            self._by_timeout[timeout] = client
         self._client = client
+
+    def _build(self, timeout: float) -> Any:
+        config = Config(
+            retries={"total_max_attempts": 1, "mode": "standard"},  # no SDK retries
+            connect_timeout=timeout,
+            read_timeout=timeout,
+        )
+        try:
+            return boto3.client("bedrock-runtime", region_name=self._region, config=config)
+        except BotoCoreError as e:
+            raise ConfigError(f"cannot create Bedrock client: {e}") from e
+
+    def _client_for(self, timeout: float) -> Any:
+        """The boto3 client for a request timeout. boto3 fixes timeouts per client, so a run that
+        asks for another timeout than the default gets (and reuses) a client built with it."""
+        if self._injected:
+            return self._client
+        with self._lock:
+            client = self._by_timeout.get(timeout)
+            if client is None:
+                client = self._by_timeout[timeout] = self._build(timeout)
+            return client
 
     def call(self, req: LLMRequest) -> LLMResponse:
         kwargs: dict[str, Any] = {
@@ -113,11 +133,11 @@ class BedrockClient:
                 "toolChoice": {"tool": {"name": req.tool.name}},
             }
         try:
-            response = self._client.converse(**kwargs)
+            response = self._client_for(req.timeout_s).converse(**kwargs)
         except (ReadTimeoutError, ConnectTimeoutError) as e:
             raise EvalFailure(
                 FailureClass.INFRA, "timeout",
-                f"Bedrock request timed out after {self.timeout}s: {e}", provider=self.provider,
+                f"Bedrock request timed out after {req.timeout_s:g}s: {e}", provider=self.provider,
             ) from e  # fmt: skip
         except ClientError as e:
             raise self._classify(e, req.role) from e

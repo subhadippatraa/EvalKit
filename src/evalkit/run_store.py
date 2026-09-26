@@ -103,6 +103,7 @@ def _case_result_from(row: sqlite3.Row, attempts: list[RunAttempt]) -> CaseResul
             status=row["status"],
             output=row["output"],
             retrieved=None if row["retrieved_json"] is None else json.loads(row["retrieved_json"]),
+            meta=None if row["meta_json"] is None else json.loads(row["meta_json"]),
             failure=_failure_from(row),
             created_at=row["created_at"],
             started_at=row["started_at"],
@@ -392,6 +393,9 @@ class RunStoreMixin:
             "status": "failed" if failure else "complete",
             "output": outcome.output,
             "retrieved_json": None if outcome.retrieved is None else json.dumps(outcome.retrieved),
+            "meta_json": None
+            if outcome.meta is None
+            else json.dumps(outcome.meta, allow_nan=False),
             "failure_class": failure and failure.failure_class.value,
             "failure_kind": failure and failure.kind,
             "failure_message": failure and failure.message,
@@ -536,7 +540,8 @@ class RunStoreMixin:
         missing real results, and failed ones missing their `skipped` rows."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT r.id, r.status, r.output, r.retrieved_json, c.case_key FROM case_results r "
+                "SELECT r.id, r.status, r.output, r.retrieved_json, r.meta_json, c.case_key "
+                "FROM case_results r "
                 "JOIN cases c ON c.id = r.case_id WHERE r.run_id = ? "
                 "AND r.status IN ('complete', 'failed') "
                 "AND (SELECT COUNT(*) FROM evaluator_results e WHERE e.case_result_id = r.id) < ? "
@@ -550,6 +555,7 @@ class RunStoreMixin:
                 r["status"],
                 r["output"],
                 None if r["retrieved_json"] is None else json.loads(r["retrieved_json"]),
+                None if r["meta_json"] is None else json.loads(r["meta_json"]),
             )
             for r in rows
         ]

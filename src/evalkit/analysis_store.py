@@ -58,6 +58,15 @@ class AnalysisStoreMixin:
             ).fetchall()
         return [(r[0], r[1], r[2], r[3]) for r in rows]
 
+    def truncated_count(self, run_id: str) -> int:
+        """Complete case results whose target said the output was cut off (meta.truncated)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM case_results WHERE run_id = ? AND status = 'complete' "
+                "AND json_extract(meta_json, '$.truncated') = 1",
+                (run_id,),
+            ).fetchone()[0]
+
     def run_info(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             row = self._run_or_raise(run_id)

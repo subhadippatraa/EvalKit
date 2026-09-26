@@ -335,23 +335,64 @@ def report_command(args: argparse.Namespace) -> tuple[int, Any]:
         kit.close()
 
 
+def _judge_spec_of_run(kit: EvalKit, run_id: str, selector: str | None) -> EvaluatorSpec:
+    """The run's own frozen llm_judge spec: its key is what reports look the check up by."""
+    run = kit.runs.get(run_id)
+    judges = [s for s in run.config.evaluators if s.kind == "llm_judge"]
+    if selector is not None:
+        judges = [s for s in judges if selector in (s.name, s.key)]
+        if not judges:
+            raise ConfigError(
+                f"run {run.id} has no llm_judge evaluator named or keyed {selector!r}"
+            )
+    if not judges:
+        raise ConfigError(f"run {run.id} has no llm_judge evaluator to check")
+    if len(judges) > 1:
+        names = ", ".join(s.name for s in judges)
+        raise ConfigError(
+            f"run {run.id} has several llm_judge evaluators ({names}): pass --evaluator"
+        )
+    return judges[0]
+
+
 def judge_check_command(args: argparse.Namespace) -> tuple[int, Any]:
-    """`evalkit judge-check [--cases FILE] [--rubric FILE]` against the env-configured judge."""
+    """`evalkit judge-check [--run RUN [--evaluator NAME]] [--cases FILE] [--rubric FILE]`
+
+    With `--run` the check is of *that run's* judge evaluator, built from its frozen spec, so its
+    result is stored under (and shown for) the evaluator key the run actually used. Without it, a
+    standalone check of the environment-configured judge under `--name`."""
     from evalkit.evaluators import llm_judge_spec
     from evalkit.models import Rubric
 
+    if args.run and args.rubric:
+        raise UsageError("--rubric cannot be combined with --run (the run's rubric is used)")
+    if not args.run and args.evaluator:
+        raise UsageError("--evaluator needs --run")
     client = client_from_env("EVALKIT_JUDGE")
-    rubric = BUILTIN_RUBRIC
-    if args.rubric:
-        rubric = Rubric.model_validate(_read_json(args.rubric))
-    cases = load_cases(args.cases) if args.cases else builtin_cases()
-    name = Path(args.cases).name if args.cases else "builtin-v1"
     kit = EvalKit.from_env()
     try:
-        result = judge_check(
-            kit, resolve(llm_judge_spec("judge-check", rubric, client)), client, cases,
-            fixture_name=name,
-        )  # fmt: skip
+        if args.run:
+            spec = _judge_spec_of_run(kit, args.run, args.evaluator)
+            frozen = spec.params
+            if (client.provider, client.model) != (frozen["provider"], frozen["model"]):
+                raise ConfigError(
+                    f"the run's judge is {frozen['provider']}/{frozen['model']} but the configured "
+                    f"judge is {client.provider}/{client.model}: a check of another judge would be "
+                    "stored under a key it does not belong to"
+                )
+            if not args.cases and frozen["rubric_content_hash"] != BUILTIN_RUBRIC.content_hash:
+                raise ConfigError(
+                    "the built-in golden set was written for the built-in rubric only; this run's "
+                    "rubric differs, so supply known-verdict cases for it with --cases"
+                )
+        else:
+            rubric = (
+                Rubric.model_validate(_read_json(args.rubric)) if args.rubric else BUILTIN_RUBRIC
+            )
+            spec = resolve(llm_judge_spec(args.name or "judge-check", rubric, client))
+        cases = load_cases(args.cases) if args.cases else builtin_cases()
+        name = Path(args.cases).name if args.cases else "builtin-v1"
+        result = judge_check(kit, spec, client, cases, fixture_name=name)
         out = result.to_dict()
         if args.min_accuracy is not None and result.accuracy < args.min_accuracy:
             return EXIT_REGRESSION, out

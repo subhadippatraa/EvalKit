@@ -34,6 +34,7 @@ DEFAULT_MIN_COVERAGE = 0.95
 MIN_N = 30  # below this many scored cases a metric carries a small-sample warning
 MIN_SLICE = 10  # a tag slice needs at least this many scored cases to be shown
 LENGTH_BIAS_MIN_N = 10
+NA_WARN_SHARE = 0.5  # above this share of not-applicable cases the headline covers a minority
 
 
 @dataclass
@@ -64,6 +65,7 @@ class EvaluatorSummary:
     scored: int
     applicable: int
     coverage: float | None
+    not_applicable_share: float  # not-applicable cases / all cases: how much this metric skips
     sufficient_coverage: bool
     evaluator_failure_rate: float | None  # evaluator-class failures / cases it was attempted on
     metrics: dict[str, MetricSummary] = field(default_factory=dict)
@@ -86,6 +88,7 @@ class RunSummary:
     case_stage: dict[str, int]
     target_failure_rate: float | None
     case_coverage: float | None  # complete case results / cases
+    truncated_outputs: int  # complete case results whose target reported a cut-off output
     target_latency_ms: dict[str, float] | None
     evaluators: dict[str, EvaluatorSummary]
     failures: list[dict[str, Any]]
@@ -246,6 +249,7 @@ def summarize(
             scored=scored,
             applicable=applicable,
             coverage=coverage,
+            not_applicable_share=counts["not_applicable"] / total if total else 0.0,
             sufficient_coverage=sufficient,
             evaluator_failure_rate=counts["failed_evaluator"] / attempted if attempted else None,
             latency_ms=_latency(eval_lat.get(key, [])),
@@ -284,6 +288,12 @@ def summarize(
                 "uncertain": unsure,
             }
             ev.pass_rate_strict = passes / total if total else None
+        if ev.not_applicable_share >= NA_WARN_SHARE:
+            warnings.append(
+                f"{key}: {ev.not_applicable_share:.0%} of the cases are not applicable to this "
+                "evaluator, so its numbers describe only the rest (a system can move cases out of "
+                "a metric by changing what it outputs)"
+            )
         if spec.kind == "llm_judge":
             pairs = store.score_vs_length(run_id, key)
             rho = (
@@ -304,6 +314,12 @@ def summarize(
                 )
         evaluators[key] = ev
 
+    truncated = store.truncated_count(run_id)
+    if truncated:
+        warnings.append(
+            f"{truncated} output(s) were truncated by the target (it hit its output limit): "
+            "they were scored as if complete"
+        )
     failures = [
         {"scope": f.scope, "class": f.failure_class, "kind": f.kind, "count": f.count}
         for f in kit.runs.failure_counts(run_id)
@@ -320,6 +336,7 @@ def summarize(
         case_stage=stage,
         target_failure_rate=stage["failed_target"] / total if total else None,
         case_coverage=stage["complete"] / total if total else None,
+        truncated_outputs=truncated,
         target_latency_ms=_latency(target_lat),
         evaluators=evaluators,
         failures=failures,

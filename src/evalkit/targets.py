@@ -28,12 +28,13 @@ from evalkit.calls import UnitCalls, describe_llm_response
 from evalkit.datasets import EvaluationCase
 from evalkit.errors import ConfigError
 from evalkit.failures import EvalFailure, Failure, FailureClass
-from evalkit.limits import MAX_DOC_ID_CHARS, MAX_DOC_IDS
+from evalkit.limits import MAX_DOC_ID_CHARS, MAX_DOC_IDS, MAX_OUTPUT_META_BYTES
 from evalkit.llm import (
     STOP_CONTENT_FILTER,
     STOP_CONTEXT_WINDOW,
     STOP_GUARDRAIL,
     STOP_MALFORMED,
+    STOP_MAX_TOKENS,
     LLMClient,
     LLMRequest,
     LLMResponse,
@@ -41,7 +42,7 @@ from evalkit.llm import (
 )
 from evalkit.runs import TargetSpec
 
-MAX_META_BYTES = 4096
+MAX_META_BYTES = MAX_OUTPUT_META_BYTES
 MAX_TEMPLATE_BYTES = 16 * 1024
 _TEMPLATE_FIELDS = frozenset({"prompt", "context"})
 
@@ -355,8 +356,12 @@ class ModelTarget:
             raise EvalFailure(
                 FailureClass.TARGET, "empty_output", "the model returned no text", raw=resp.raw
             )
-        # a max_tokens stop is still an answer (a truncated one): kept, and flagged in the meta
-        meta: dict[str, Any] = {"stop_reason": resp.stop_reason}
+        # a max_tokens stop is still an answer (a truncated one): kept, and flagged in the meta,
+        # which is stored with the case result (evaluators and reports can see it)
+        meta: dict[str, Any] = {
+            "stop_reason": resp.stop_reason,
+            "truncated": resp.stop_reason == STOP_MAX_TOKENS,
+        }
         if resp.request_id:
             meta["request_id"] = resp.request_id
         return TargetOutput(text, usage=resp.usage, meta=meta)

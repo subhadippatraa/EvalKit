@@ -69,6 +69,7 @@ from evalkit.limits import (
     MAX_ERROR_CHARS,
     MAX_EVIDENCE_BYTES,
     MAX_METRICS,
+    MAX_OUTPUT_META_BYTES,
     MAX_RUN_EVALUATORS,
     MAX_TAG_CHARS,
     Limits,
@@ -374,6 +375,9 @@ class CaseOutcome(BaseModel):
 
     output: str | None = None
     retrieved: list[str] | None = None  # doc ids the target's retriever returned, in rank order
+    # what the target reported about this output (stop reason, truncation, request id): plain,
+    # small JSON, stored with the result and visible to evaluators and reports
+    meta: dict[str, Any] | None = None
     failure: Failure | None = None
     started_at: AwareDatetime | None = None
     finished_at: AwareDatetime = Field(default_factory=_now)
@@ -386,6 +390,13 @@ class CaseOutcome(BaseModel):
             raise ValueError("a case outcome has an output or a failure, exactly one of them")
         if self.failure is not None and self.retrieved is not None:
             raise ValueError("a failed case outcome carries no retrieved documents")
+        if self.failure is not None and self.meta is not None:
+            raise ValueError("a failed case outcome carries no output metadata")
+        if self.meta is not None:
+            self.meta = _json_object(self.meta, "output metadata")
+            size = len(json.dumps(self.meta).encode("utf-8", "replace"))
+            if size > MAX_OUTPUT_META_BYTES:
+                raise ValueError(f"output metadata is larger than {MAX_OUTPUT_META_BYTES} bytes")
         _check_failure_classes(self.failure, CASE_RESULT_CLASSES, "case")
         _check_times(self.started_at, self.finished_at)
         return self
@@ -412,6 +423,7 @@ class CaseResult(BaseModel):
     status: Literal["pending", "complete", "failed"]
     output: str | None = None
     retrieved: list[str] | None = None
+    meta: dict[str, Any] | None = None  # what the target reported about the output
     failure: Failure | None = None
     created_at: AwareDatetime
     started_at: AwareDatetime | None = None
@@ -424,7 +436,8 @@ class CaseResult(BaseModel):
         pending = self.status == "pending"
         if pending:
             if any(
-                v is not None for v in (self.output, self.retrieved, self.failure, self.finished_at)
+                v is not None
+                for v in (self.output, self.retrieved, self.meta, self.failure, self.finished_at)
             ):
                 raise ValueError("a pending case result has no outcome yet")
             return self
@@ -587,6 +600,7 @@ class Unit:
     status: Literal["pending", "complete", "failed"]
     output: str | None = None
     retrieved: list[str] | None = None
+    meta: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

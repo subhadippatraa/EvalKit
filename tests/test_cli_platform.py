@@ -324,3 +324,91 @@ def test_a_bad_gates_file_is_a_usage_error(cli):
     code, _, err = cli("compare", b, "--baseline", a, "--gates", bad)
     assert code == 2 and "nodot" in err
     assert cli("compare", b, "--baseline", a, "--gates", str(cli.tmp / "missing.toml"))[0] == 2
+
+
+# --- judge-check names the evaluator it checks (P1.1, audit P1-11) -----------------------------
+
+
+class GoldJudge:
+    provider, model = "fake", "j"
+
+    def call(self, req):
+        from evalkit.judgecheck import builtin_cases
+
+        for c in builtin_cases():
+            if f"\n{c.output}\n" in req.user and c.prompt in req.user:
+                score = 5 if c.expected == "PASS" else 1
+                return LLMResponse(payload=judged(correctness=score), stop_reason="tool_use")
+        return LLMResponse(payload=judged(correctness=5), stop_reason="tool_use")
+
+
+BUILTIN_RUBRIC_JSON = {
+    "criteria": [
+        {
+            "name": "correctness",
+            "description": "Is the answer factually correct and does it answer the question?",
+        }
+    ],
+    "threshold": 0.75,
+    "version": "judge-check-builtin-v1",
+}
+
+
+def test_judge_check_of_a_run_is_stored_under_that_runs_evaluator_key(cli, monkeypatch):
+    monkeypatch.setattr(cli_platform, "client_from_env", lambda prefix: GoldJudge())
+    spec = {"evaluators": [{"kind": "llm_judge", "name": "quality",
+                            "params": {"rubric": BUILTIN_RUBRIC_JSON}}]}  # fmt: skip
+    run = create(cli, spec)
+    assert cli("runs", "execute", run)[0] == 0
+    key = next(iter(cli("runs", "show", run)[1]["counts"]["evaluator_results"]))
+    code, out, err = cli("judge-check", "--run", run, "--evaluator", "quality")
+    assert code == 0, err
+    assert out["evaluator_key"] == key  # not a hard-coded "judge-check" identity
+    assert out["accuracy"] == 1.0 and out["stored_id"]
+    report = cli.tmp / "r.html"
+    assert cli("report", run, "--out", str(report))[0] == 0
+    html = report.read_text()
+    assert "17/17 correct" in html and "not checked" not in html
+
+
+def test_judge_check_of_a_run_checks_the_runs_own_judge_and_rubric(cli, monkeypatch):
+    class Other(GoldJudge):
+        model = "another-model"
+
+    monkeypatch.setattr(cli_platform, "client_from_env", lambda prefix: GoldJudge())
+    spec = {"evaluators": [{"kind": "llm_judge", "name": "quality",
+                            "params": {"rubric": BUILTIN_RUBRIC_JSON}}]}  # fmt: skip
+    run = create(cli, spec)
+    monkeypatch.setattr(cli_platform, "client_from_env", lambda prefix: Other())
+    code, _, err = cli("judge-check", "--run", run)
+    assert code == 1 and "another-model" in err and "judge" in err
+
+
+def test_the_builtin_golden_set_is_refused_for_a_rubric_it_was_not_written_for(cli, monkeypatch):
+    monkeypatch.setattr(cli_platform, "client_from_env", lambda prefix: GoldJudge())
+    run = create(cli, {"evaluators": [JUDGE_SPEC]})  # a different rubric ("quality")
+    code, _, err = cli("judge-check", "--run", run)
+    assert code == 1 and "--cases" in err and "built-in" in err
+
+
+def test_judge_check_needs_an_unambiguous_llm_judge_evaluator(cli, monkeypatch):
+    monkeypatch.setattr(cli_platform, "client_from_env", lambda prefix: GoldJudge())
+    code, _, err = cli("judge-check", "--run", create(cli, EM))
+    assert code == 1 and "llm_judge" in err
+    two = {"evaluators": [
+        {"kind": "llm_judge", "name": "a", "params": {"rubric": BUILTIN_RUBRIC_JSON}},
+        {"kind": "llm_judge", "name": "b", "params": {"rubric": BUILTIN_RUBRIC_JSON}},
+    ]}  # fmt: skip
+    run = create(cli, two)
+    code, _, err = cli("judge-check", "--run", run)
+    assert code == 1 and "--evaluator" in err
+    assert cli("judge-check", "--run", run, "--evaluator", "a")[0] == 0
+    assert cli("judge-check", "--run", run, "--evaluator", "zzz")[0] == 1
+
+
+def test_a_standalone_judge_check_can_be_named(cli, monkeypatch):
+    monkeypatch.setattr(cli_platform, "client_from_env", lambda prefix: GoldJudge())
+    code, out, _ = cli("judge-check", "--name", "my-judge")
+    assert code == 0 and out["evaluator_key"].startswith("llm_judge:my-judge:")
+    code, _, err = cli("judge-check", "--run", "x", "--rubric", "r.json")
+    assert code == 2 and "--rubric" in err

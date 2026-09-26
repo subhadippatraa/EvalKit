@@ -14,6 +14,7 @@ evaluator failure, a truncated target answer is still an answer).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -88,9 +89,35 @@ class LLMClient(Protocol):
     def call(self, req: LLMRequest) -> LLMResponse: ...
 
 
-def rejected_request(role: str, provider: str, message: str, **meta: Any) -> EvalFailure:
-    """The provider refused the request itself (400 / unknown model): every call would fail, so it
-    is systemic, and who is to blame depends on the caller (design 7.4)."""
+# A provider that rejects a request because THIS input is too long is describing the case, not the
+# configuration: every other case would have been accepted. Providers say so in prose (Bedrock's
+# ValidationException) or with a code (OpenAI-compatible `context_length_exceeded`). This is a
+# heuristic over documented phrasings, deliberately narrow, and it has NOT been verified against a
+# live provider (docs/EVALUATION-METHODOLOGY.md). A phrasing it misses is treated as a rejected
+# request, which is stopped only when it repeats (calls.RunGuard), never on first sight.
+_OVERSIZE = re.compile(
+    r"(input|prompt|request|message)s?\b.{0,40}\btoo (long|large|big)"
+    r"|too many (input |prompt )?tokens"
+    r"|(maximum|max(imum)?) (context|input|prompt)( length| window| size| tokens)?"
+    r"|context (length|window) (exceeded|limit)|exceeds? the (model'?s? )?(context|token)",
+    re.IGNORECASE,
+)
+_OVERSIZE_CODES = frozenset({"context_length_exceeded", "string_above_max_length"})
+
+
+def looks_oversize(message: str, code: str | None = None) -> bool:
+    return code in _OVERSIZE_CODES or bool(_OVERSIZE.search(message))
+
+
+def rejected_request(
+    role: str, provider: str, message: str, *, code: str | None = None, **meta: Any
+) -> EvalFailure:
+    """The provider refused the request itself (400 / unknown model). Who is to blame depends on
+    what was wrong (design 7.4): an input too long for the model is `input.oversize`, the case's
+    own problem; anything else says the configuration is wrong -- every call would fail, so it is
+    systemic (stopped on repetition) -- and depends on the caller's role."""
+    if looks_oversize(message, code):
+        return EvalFailure(FailureClass.INPUT, "oversize", message, provider=provider, **meta)
     if role == "target":
         return EvalFailure(FailureClass.INPUT, "bad_config", message, provider=provider, **meta)
     return EvalFailure(FailureClass.EVALUATOR, "bad_request", message, provider=provider, **meta)

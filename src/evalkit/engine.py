@@ -602,11 +602,18 @@ class RunController:
             raise PreflightError(report)
         resolved = [resolve(s) for s in evaluators]
         config = RunConfig(target=spec_of(target), evaluators=resolved, policy=dict(policy or {}))
-        env = dict(environment or {}) | {"preflight": report.to_json()}
+        exec_policy = ExecPolicy.from_mapping(dict(policy or {}))
+        env = dict(environment or {}) | {
+            "preflight": report.to_json(),
+            # what the run's requests were allowed to take (the policy is frozen with the run too;
+            # this is the plain-language record, and what compare names when two runs differ)
+            "request_timeout_s": exec_policy.retry.timeout_s,
+            "unit_deadline_s": exec_policy.retry.deadline_s,
+        }
         run = self.runs.create(
             dataset_ref, config, name=name, idempotency_key=idempotency_key, environment=env
         )
-        self.runs.plan(run.id, seed=ExecPolicy.from_mapping(config.policy).seed)
+        self.runs.plan(run.id, seed=exec_policy.seed)
         return run
 
     # -- execution --------------------------------------------------------------------------
@@ -961,9 +968,10 @@ class _Exec:
                 return
             if not self.writer.put(case_item):
                 return
-            output, retrieved, failed = outcome.output, outcome.retrieved, False
+            output, retrieved, meta, failed = outcome.output, outcome.retrieved, outcome.meta, False
         else:
-            output, retrieved, failed = unit.output, unit.retrieved, unit.status == "failed"
+            output, retrieved, meta = unit.output, unit.retrieved, unit.meta
+            failed = unit.status == "failed"
         pending = [ev for ev in self.evaluators if ev.key not in done]
         if failed:  # a stranded failed case result: only its skipped rows are missing
             if pending:
@@ -972,7 +980,7 @@ class _Exec:
         for ev in pending:
             einp = EvalInput(
                 case.case_key, case.prompt, output or "", case.reference, case.context,
-                case.relevance, retrieved,
+                case.relevance, retrieved, meta,
             )  # fmt: skip
             eo, attempts = self._evaluate(ev, einp)
             item = WriteItem("evaluator", unit.case_key, eo, attempts)
@@ -996,7 +1004,7 @@ class _Exec:
                 base.case_key,
                 base.prompt,
                 base.context,
-                TargetOutput(src.output or "", src.retrieved),
+                TargetOutput(src.output or "", src.retrieved, meta=src.meta or {}),
             )
         return view(case)
 
@@ -1021,7 +1029,7 @@ class _Exec:
                     f"the target's output is larger than {limit} bytes",
                 )
             return CaseOutcome.complete(
-                out.output, retrieved=out.retrieved, **timing()
+                out.output, retrieved=out.retrieved, meta=out.meta or None, **timing()
             ), calls.attempts
         except EvalFailure as f:
             return CaseOutcome.fail(f.failure, **timing()), calls.attempts

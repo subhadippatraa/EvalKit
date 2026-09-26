@@ -57,7 +57,7 @@ def _status_failure(e: OpenAIAPIStatusError, role: str) -> EvalFailure:
     text = f"Bedrock (OpenAI-compatible) API error: {e}"
     extra = {"http_status": status, "request_id": getattr(e, "request_id", None)}
     if status in (400, 404, 422):
-        return rejected_request(role, _PROVIDER, text, **extra)
+        return rejected_request(role, _PROVIDER, text, code=getattr(e, "code", None), **extra)
     if status in (401, 403):
         return EvalFailure(FailureClass.INFRA, "auth", text, provider=_PROVIDER, **extra)
     if status == 429:
@@ -108,6 +108,7 @@ class BedrockOpenAIClient:
             ],
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
+            "timeout": req.timeout_s,  # the run's request timeout, not the client's default
         }
         if req.tool is not None:
             kwargs["tools"] = [

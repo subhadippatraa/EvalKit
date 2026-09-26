@@ -153,6 +153,9 @@ def _parser() -> argparse.ArgumentParser:
     jc.add_argument("--cases", help="JSONL of known-verdict cases (default: the built-in set)")
     jc.add_argument("--rubric", help="rubric JSON for --cases (default: the built-in rubric)")
     jc.add_argument("--min-accuracy", type=float, help="exit 3 if accuracy is lower")
+    jc.add_argument("--run", help="check the llm_judge evaluator of this run (its exact spec)")
+    jc.add_argument("--evaluator", help="with --run: the judge's name or key (if several)")
+    jc.add_argument("--name", help="without --run: the evaluator name to check under")
 
     review = sub.add_parser("review", help="add a human review")
     review.add_argument("id")

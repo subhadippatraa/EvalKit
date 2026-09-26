@@ -300,7 +300,7 @@ def test_a_model_target_renders_the_template_and_returns_text_usage_and_meta():
     u = unit()
     out = t.generate(TargetInput("k", "Capital of France?", "geography"), u)
     assert out.output == "Paris" and out.usage == Usage(11, 5)
-    assert out.meta == {"stop_reason": "end_turn", "request_id": "r1"}
+    assert out.meta == {"stop_reason": "end_turn", "truncated": False, "request_id": "r1"}
     (req,) = client.requests
     assert req.user == "Q: Capital of France?\nC: geography" and req.tool is None
     assert (req.temperature, req.max_tokens, req.role) == (0.2, 50, "target")

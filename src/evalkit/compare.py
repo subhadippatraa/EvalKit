@@ -44,6 +44,8 @@ if TYPE_CHECKING:
 
 MIN_PAIRED = 30
 COVERAGE_GAP = 0.05
+NA_GAP = 0.05  # a difference in not-applicable share worth a warning
+TRUNCATION_GAP = 0.05
 _TOP = 10
 CI_B = stats.BOOTSTRAP_B  # bootstrap resamples for paired intervals (tests lower it for speed)
 
@@ -99,6 +101,9 @@ class Comparison:
     exclusions: dict[str, dict[str, int]]
     unpaired: dict[str, int]  # input_changed | only_baseline | only_candidate: cases not paired
     coverage: dict[str, dict[str, float | None]]
+    pairs: dict[str, str]  # candidate evaluator key -> the baseline key it was compared with
+    not_applicable: dict[str, dict[str, float]]  # per side and evaluator: share of common cases
+    truncated: dict[str, float]  # per side: share of complete outputs the target cut off
     metrics: list[MetricComparison]
     warnings: list[str]
     noise_floor: dict[str, float] = field(default_factory=dict)
@@ -221,7 +226,22 @@ def compare(
         )
     if base.exec_hash != cand.exec_hash:
         info.append("execution policy differs (speed and cost only; not a confounder)")
+    bt, ct = base.environment.get("request_timeout_s"), cand.environment.get("request_timeout_s")
+    if bt != ct:
+        info.append(
+            f"request timeout differs ({bt} s vs {ct} s): a shorter timeout turns slow answers "
+            "into failures, which shows up as coverage, not as a different score"
+        )
     same_identity = base.identity_hash == cand.identity_hash
+    unpinned = [r.id for r in (base, cand) if _unpinned(r.config.target)]
+    if unpinned:
+        # EvalKit cannot hash code: two runs of an undeclared callable look identical whatever
+        # changed in it, so neither "same identity" nor a noise floor may be claimed
+        same_identity = False
+        info.append(
+            "a callable target declares no fingerprint (unpinned): EvalKit cannot tell a rerun "
+            "from a code change, so no noise floor is offered"
+        )
 
     b_out, c_out = store.case_outcomes(baseline_id), store.case_outcomes(candidate_id)
     # Pair on (case_key, input_hash): the question side of the case. The system's own output is
@@ -312,6 +332,27 @@ def compare(
                 f"{c_specs[ck].name} (baseline {cb:.1%}, candidate {cc:.1%}); an apparent change "
                 "may come from which cases were scored"
             )
+    na_share: dict[str, dict[str, float]] = {"baseline": {}, "candidate": {}}
+    for bk, ck, _ in pairs:
+        nb = sum(1 for k in common if b_out[k]["evaluators"].get(bk, ("",))[0] == "not_applicable")
+        nc = sum(1 for k in common if c_out[k]["evaluators"].get(ck, ("",))[0] == "not_applicable")
+        na_share["baseline"][bk], na_share["candidate"][ck] = nb / len(common), nc / len(common)
+        if abs(nb - nc) / len(common) > NA_GAP:
+            warnings.append(
+                f"not applicable share differs for {c_specs[ck].kind}:{c_specs[ck].name} "
+                f"(baseline {nb / len(common):.1%}, candidate {nc / len(common):.1%}): the metric "
+                "is computed on different cases, and a system can leave a metric by changing what "
+                "it outputs"
+            )
+    truncated = {
+        "baseline": sb.truncated_outputs / sb.cases if sb.cases else 0.0,
+        "candidate": sc.truncated_outputs / sc.cases if sc.cases else 0.0,
+    }
+    if abs(truncated["baseline"] - truncated["candidate"]) > TRUNCATION_GAP:
+        warnings.append(
+            f"truncated outputs differ (baseline {truncated['baseline']:.1%}, candidate "
+            f"{truncated['candidate']:.1%}): cut-off answers were scored as if complete"
+        )
     noise = {}
     if same_identity:
         info.append(
@@ -336,12 +377,19 @@ def compare(
         exclusions={k: dict(v) for k, v in exclusions.items()},
         unpaired=unpaired,
         coverage=coverage,
+        pairs={ck: bk for bk, ck, _ in pairs},
+        not_applicable=na_share,
+        truncated=truncated,
         metrics=metrics,
         warnings=warnings,
         noise_floor=noise,
         latency=_latency(b_out, c_out, common),
         seed=seed,
     )
+
+
+def _unpinned(target: Any) -> bool:
+    return target.kind == "callable" and not target.identity.get("fingerprint")
 
 
 def _scored(entry: dict[str, Any], key: str) -> bool:
@@ -470,6 +518,13 @@ class Gates:
     min_coverage: float = DEFAULT_MIN_COVERAGE
     min_n: int = MIN_PAIRED
     strict: bool = False  # inconclusive is a failure (exit 4)
+    # a candidate must not be able to leave a metric to hide a regression: the not-applicable share
+    # may differ from the baseline's by at most this (None: not checked), and may not exceed
+    # `max_na_share` outright (None: no cap)
+    max_na_asymmetry: float | None = NA_GAP
+    max_na_share: float | None = None
+    max_truncated_share: float | None = None  # cap on the candidate's truncated-output share
+    allow_unpinned: bool = False  # accept a callable target that declares no fingerprint
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.min_coverage <= 1.0:
@@ -482,13 +537,24 @@ class Gates:
         for sel, rate in self.must_pass.items():
             if isinstance(rate, bool) or not 0.0 <= rate <= 1.0:
                 raise ValueError(f"must_pass {sel!r}: the allowed failure rate is within [0, 1]")
+        for name in ("max_na_asymmetry", "max_na_share", "max_truncated_share"):
+            v = getattr(self, name)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int | float)):
+                raise ValueError(f"{name} must be a number or absent")
+            if v is not None and not 0.0 <= v <= 1.0:
+                raise ValueError(f"{name} must be within [0, 1]")
+        if not isinstance(self.allow_unpinned, bool):
+            raise ValueError("allow_unpinned must be true or false")
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> Gates:
         data = dict(data)
         raw = dict(data.pop("gates", {}))
         floors = dict(raw.pop("floor", {}))
-        known = {"min_coverage", "min_n", "strict", "must_pass"}
+        known = {
+            "min_coverage", "min_n", "strict", "must_pass", "max_na_asymmetry", "max_na_share",
+            "max_truncated_share", "allow_unpinned",
+        }  # fmt: skip
         unknown = set(data) - known
         if unknown:
             raise ValueError(f"unknown gate setting(s): {sorted(unknown)}")
@@ -509,6 +575,10 @@ class Gates:
             data.get("min_coverage", DEFAULT_MIN_COVERAGE),
             data.get("min_n", MIN_PAIRED),
             data.get("strict", False),
+            data.get("max_na_asymmetry", NA_GAP),
+            data.get("max_na_share"),
+            data.get("max_truncated_share"),
+            data.get("allow_unpinned", False),
         )
 
     @classmethod
@@ -760,6 +830,53 @@ def evaluate_gates(
                     "code": "coverage",
                     "message": f"{key}: coverage {shown} is below the required "
                     f"{gates.min_coverage:.0%}; a gate cannot pass on missing data",
+                }
+            )
+    declared = bool(gates.metrics or gates.floors or gates.must_pass)
+    if declared and not gates.allow_unpinned:
+        runs = [candidate_id] + ([comparison.baseline_id] if comparison is not None else [])
+        for rid in runs:
+            if _unpinned(kit.runs.get(rid).config.target):
+                failures.append(
+                    {
+                        "code": "unpinned_target",
+                        "message": f"run {rid}: the callable target declares no fingerprint, so a "
+                        "gate cannot tell what code it measured (pass --fingerprint, or set "
+                        "allow_unpinned)",
+                    }
+                )
+    for key in sorted(referenced):
+        share = sc.evaluators[key].not_applicable_share
+        if gates.max_na_share is not None and share > gates.max_na_share:
+            failures.append(
+                {
+                    "code": "not_applicable_share",
+                    "message": f"{key}: {share:.1%} of the candidate's cases are not applicable "
+                    f"(allowed {gates.max_na_share:.1%}): the metric covers too little",
+                }
+            )
+        bk = None if comparison is None else comparison.pairs.get(key)
+        if gates.max_na_asymmetry is not None and comparison is not None and bk is not None:
+            gap = comparison.not_applicable["candidate"].get(key, 0.0) - (
+                comparison.not_applicable["baseline"].get(bk, 0.0)
+            )
+            if abs(gap) > gates.max_na_asymmetry:
+                failures.append(
+                    {
+                        "code": "not_applicable_asymmetry",
+                        "message": f"{key}: the not-applicable share moved by {gap:+.1%} against "
+                        f"the baseline (allowed {gates.max_na_asymmetry:.1%}): the metric is "
+                        "computed on different cases",
+                    }
+                )
+    if gates.max_truncated_share is not None:
+        share = sc.truncated_outputs / sc.cases if sc.cases else 0.0
+        if share > gates.max_truncated_share:
+            failures.append(
+                {
+                    "code": "truncated_share",
+                    "message": f"{share:.1%} of the candidate's outputs were truncated by the "
+                    f"target (allowed {gates.max_truncated_share:.1%})",
                 }
             )
     inconclusive = [d for d in decisions if d.decision == "inconclusive"]

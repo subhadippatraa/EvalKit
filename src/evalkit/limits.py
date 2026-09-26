@@ -33,6 +33,7 @@ MAX_CONFIG_BYTES = 256 * 1024  # a frozen RunConfig, JSON
 MAX_RUN_EVALUATORS = 32
 MAX_ATTEMPTS = 100  # attempts recorded with one result
 MAX_METRICS = 256  # per evaluator result
+MAX_OUTPUT_META_BYTES = 4096  # what a target may report about one output (stop reason, ...)
 
 MAX_EVIDENCE_BYTES = 64 * 1024  # raw judge output kept per failed attempt
 MAX_ERROR_CHARS = 2000

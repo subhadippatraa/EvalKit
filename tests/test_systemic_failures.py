@@ -209,3 +209,37 @@ def test_the_threshold_is_an_execution_policy_and_is_validated():
     for bad in (0, -1, True, 1.5):
         with pytest.raises(ValueError):
             ExecPolicy.from_mapping({"systemic_threshold": bad})
+
+
+def test_an_over_long_case_is_recorded_as_oversize_and_never_stops_the_run(tmp_path):
+    kit = setup(tmp_path, bad={3, 12, 30})
+    judge = Judge(
+        reject=lambda text: "BADINPUT" in text,
+        error=EvalFailure("input", "oversize", "Input is too long for requested model."),
+    )
+    run = judge_run(kit, judge, {"concurrency": 1})
+    report = kit.controller.execute(run.id, clients=[judge])
+    assert report.status == "succeeded"
+    failures = kit.runs.failures(run.id)
+    assert {(f.case_key, f.failure.failure_class.value, f.failure.kind) for f in failures} == {
+        ("c003", "input", "oversize"),
+        ("c012", "input", "oversize"),
+        ("c030", "input", "oversize"),
+    }
+    kit.close()
+
+
+def test_the_request_timeout_is_recorded_with_the_run_and_named_when_runs_differ(tmp_path):
+    from evalkit.compare import compare
+
+    kit = setup(tmp_path, n=35)
+    judge = Judge()
+    fast = judge_run(kit, judge, {"retry": {"timeout_s": 5.0, "base_s": 0.001, "cap_s": 0.002}})
+    slow = judge_run(kit, judge, {"retry": {"timeout_s": 90.0, "base_s": 0.001, "cap_s": 0.002}})
+    assert fast.environment["request_timeout_s"] == 5.0
+    assert slow.environment["request_timeout_s"] == 90.0
+    kit.controller.execute(fast.id, clients=[judge])
+    kit.controller.execute(slow.id, clients=[judge])
+    cmp = compare(kit, fast.id, slow.id)
+    assert any("request timeout" in i and "5" in i and "90" in i for i in cmp.informational)
+    kit.close()
