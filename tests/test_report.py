@@ -398,3 +398,34 @@ def test_the_report_opens_offline_it_references_nothing_outside_itself(kit, tmp_
     text = out.read_text(encoding="utf-8")
     body_without_text = re.sub(r"<pre>.*?</pre>", "", text, flags=re.S)
     assert not re.search(r"(?i)\b(src|href|action|data)\s*=", body_without_text)
+
+
+def test_the_page_is_well_formed_every_tag_balanced(kit):
+    class Balance(HTMLParser):
+        VOID = {"meta", "br"}
+
+        def __init__(self):
+            super().__init__()
+            self.stack, self.errors = [], []
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in self.VOID:
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if tag in self.VOID:
+                return
+            if not self.stack or self.stack[-1] != tag:
+                self.errors.append(tag)
+            else:
+                self.stack.pop()
+
+    def target(inp):
+        if inp.case_key == "c01":
+            raise RuntimeError("boom <b>x</b>")
+        return "o"
+
+    run = make(kit, target=CallableTarget(target, name="t", fingerprint="1"))
+    b = Balance()
+    b.feed(render_report(kit, run.id))
+    assert b.errors == [] and b.stack == []

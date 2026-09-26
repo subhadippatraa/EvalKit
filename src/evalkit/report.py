@@ -14,7 +14,7 @@ from __future__ import annotations
 import html
 import json
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -579,11 +579,13 @@ def render_report(
     max_cases: int = DEFAULT_MAX_CASES,
     min_coverage: float | None = None,
     seed: int = 0,
+    prices: Mapping[str, tuple[float, float]] | None = None,
 ) -> str:
-    """The report as one HTML string."""
+    """The report as one HTML string. `prices` (model id -> USD per million input/output tokens)
+    adds an ESTIMATED cost; without it none is shown."""
     if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases < 0:
         raise RunError("max_cases must be a non-negative integer")
-    options: dict[str, Any] = {"seed": seed}
+    options: dict[str, Any] = {"seed": seed, "prices": prices}
     if min_coverage is not None:
         options["min_coverage"] = min_coverage
     summary = summarize(kit, run_id, **options)

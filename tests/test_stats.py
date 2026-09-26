@@ -105,6 +105,11 @@ def test_bootstrap_ci_of_the_mean_has_about_nominal_coverage():
     assert 0.88 <= hits / 300 <= 0.99
 
 
+def test_mde_is_two_point_eight_standard_errors():
+    xs = [0.0, 1.0, 2.0, 3.0]
+    assert stats.mde(xs) == pytest.approx(2.8 * stats.stdev(xs) / 2)  # sqrt(4) = 2
+
+
 def test_mde_scales_with_noise_and_shrinks_with_n():
     rng = random.Random(3)
     noisy = [rng.gauss(0, 1.0) for _ in range(100)]

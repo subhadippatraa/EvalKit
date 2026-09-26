@@ -20,7 +20,6 @@ import math
 import random
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -319,7 +318,3 @@ def disagreements(kit: EvalKit, run_id: str, *, tau: float = 0.25) -> dict[str, 
         "tau": tau,
         "cases": cases,
     }
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat()

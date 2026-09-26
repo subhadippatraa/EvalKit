@@ -408,10 +408,18 @@ def test_a_gullible_judge_is_caught_by_the_adversarial_cases(kit):
 
 
 def test_a_judge_that_cannot_judge_is_not_counted_correct(kit):
-    client = Scripted(lambda text: EvalFailure("infrastructure", "auth", "denied"))
+    client = Scripted(lambda text: EvalFailure("evaluator", "refused", "policy"))
     result = judge_check(kit, spec_for(client), client)
     assert (result.correct, result.failed, result.accuracy) == (0, 17, 0.0)
-    assert result.results[0]["failure"].startswith("infrastructure.auth")
+    assert result.results[0]["failure"].startswith("evaluator.refused")
+
+
+def test_a_systemic_failure_stops_the_check_at_once_and_stores_nothing(kit):
+    client = Scripted(lambda text: EvalFailure("evaluator", "bad_request", "Operation not allowed"))
+    with pytest.raises(ConfigError, match="cannot be used.*stopped after 0 of 17 cases"):
+        judge_check(kit, spec_for(client), client)
+    assert len(client.requests) == 1  # one call, not seventeen
+    assert kit.store.latest_judge_check(spec_for(client).key) is None
 
 
 def test_judge_check_can_skip_storage_and_needs_a_judge_spec(kit):

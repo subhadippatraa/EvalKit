@@ -1,6 +1,41 @@
 # Changelog
 
-## Unreleased - P1 (in progress)
+## Unreleased - P1: the evaluation platform
+
+Adds a single-process evaluation platform on the existing SQLite store. The single-record
+`Evaluator` API, its tables and its CLI commands are unchanged; migrations 3-5 apply on open (with a
+backup) and released migrations 1-2 are byte-identical.
+
+### Execution, targets, evaluators (migration 5 adds summaries, tags, generalized reviews, judge checks)
+
+- New: `EvalKit.controller` (`RunController`): preflight, `create`, `execute` / resume, cancellation
+  (`CancelToken`, Ctrl-C in the CLI), a thread pool with a bounded window and a single batching
+  writer, seeded processing order, retry with full-jitter backoff, per-call timeouts, a rate limiter,
+  a consecutive-failure breaker, token / call / duration budgets, spill-and-replay when storage
+  fails. Not included (P2): retrying failed results, leases / multi-process workers, response cache.
+- New targets: `precomputed`, `reuse`, `callable`, `model` (no `http`). Targets never see the
+  reference, labels, tags or metadata.
+- New evaluators: `exact_match`, `regex`, `json_schema` (optional `evalkit[jsonschema]`),
+  `retrieval`, `citation_check`, `llm_judge`; `Criterion.must_pass` / `min_normalized` (rubric hashes of
+  existing rubrics are unchanged).
+- **LLM client split**: `evalkit.llm` (`LLMClient`, `LLMRequest`, `LLMResponse`), `BedrockClient` /
+  `BedrockOpenAIClient` own the request, usage, latency, request id and classified provider errors;
+  `evalkit.judge_eval` owns judge semantics. `BedrockJudge` / `BedrockOpenAIJudge` remain, unchanged
+  in behaviour, as adapters (their errors now also carry `.failure`). SDK retries stay off.
+- Failure taxonomy gains `infrastructure.internal_error`; `input.bad_config` is systemic.
+
+### Analysis
+
+- New: aggregation with denominators, coverage and intervals (headline withheld below the required
+  coverage), paired comparison with confounder detection, decision rule and declared gates
+  (`evalkit compare`, exit codes 3 / 4), human review / calibration / review queues / evaluator
+  disagreement, `judge-check` golden set with adversarial cases, static HTML report
+  (`evalkit report`). `reviews` is rebuilt (append-only) to grade a run's case result as well as a
+  legacy evaluation.
+- New CLI: `runs create|execute|resume|tag|review|calibrate|queue|disagreements`, `compare`,
+  `report`, `judge-check`. `runs create` now takes a spec file (preflight + plan).
+- New: `examples/quickstart`, `scripts/benchmark.py`, `scripts/mutation.py`, `docs/BENCHMARK.md`.
+
 
 ### Runs, results, attempts, failure taxonomy
 

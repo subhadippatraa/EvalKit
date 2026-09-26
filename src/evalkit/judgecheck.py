@@ -255,7 +255,8 @@ def judge_check(
     store: bool = True,
 ) -> JudgeCheckResult:
     """Run the golden set through the `llm_judge` evaluator `spec` and (by default) store the
-    result against its `evaluator_key`. A judge that cannot judge a case is not counted correct."""
+    result against its `evaluator_key`. A judge that cannot judge a case is not counted correct; a
+    *systemic* failure (auth, a rejected model or request) stops the check with a `ConfigError`."""
     if spec.kind != "llm_judge":
         raise ConfigError("judge-check applies to llm_judge evaluators")
     cases = list(cases if cases is not None else builtin_cases())
@@ -277,6 +278,11 @@ def judge_check(
             )
             row["verdict"], row["score"] = out.verdict, out.metrics.get("score")
         except EvalFailure as f:
+            if f.systemic:  # every remaining case would fail identically: say so, do not spend
+                raise ConfigError(
+                    f"the judge cannot be used ({f.failure_class.value}.{f.kind}: {f}); "
+                    f"stopped after {len(results)} of {len(cases)} cases, nothing was stored"
+                ) from f
             row["failure"] = f"{f.failure_class.value}.{f.kind}: {f}"
         row["correct"] = row["verdict"] == case.expected
         row["attempts"] = len(calls.attempts)

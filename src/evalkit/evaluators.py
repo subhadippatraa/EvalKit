@@ -152,10 +152,6 @@ def _only(params: dict[str, Any], allowed: set[str], kind: str) -> None:
         )
 
 
-def _base(spec: EvaluatorSpec) -> dict[str, Any]:
-    return {"kind": spec.kind, "key": spec.key}
-
-
 class _Evaluator:
     requires: frozenset[str] = frozenset()
 

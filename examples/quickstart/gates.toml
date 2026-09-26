@@ -1,0 +1,9 @@
+# Only declared gates can fail a build. Tolerances are absolute differences in the metric.
+min_coverage = 0.95
+
+[gates]
+"exact_match:answer.match" = { direction = "higher", delta = 0.02 }
+"run.target_failure_rate"  = { direction = "lower",  delta = 0.01 }
+
+[gates.floor]
+"exact_match:answer.match" = 0.80

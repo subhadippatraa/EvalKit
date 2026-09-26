@@ -1,0 +1,19 @@
+# Same evaluators, but the outputs come from running `targets.py:candidate`.
+[target]
+kind = "callable"
+callable = "targets:candidate"
+fingerprint = "quickstart-candidate-v1"   # declare what you are testing (e.g. a git sha)
+
+[[evaluators]]
+kind = "exact_match"
+name = "answer"
+params = { normalize = ["strip"] }
+
+[[evaluators]]
+kind = "regex"
+name = "is_number"
+params = { pattern = "^[0-9]+$", mode = "fullmatch" }
+
+[policy]
+concurrency = 4
+seed = 1

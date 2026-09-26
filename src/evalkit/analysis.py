@@ -22,7 +22,6 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from evalkit import stats
@@ -116,6 +115,8 @@ def metric_seed(seed: int, key: str, name: str) -> int:
 def summarize_metric(
     name: str, values: list[float], *, reliable: bool, seed: int, reason: str | None = None
 ) -> MetricSummary:
+    # storage order is arbitrary (row ids are random); the interval must depend on the values only
+    values = sorted(values)
     n = len(values)
     binary = stats.is_binary(values)
     mean = stats.mean(values)
@@ -377,7 +378,3 @@ def take_snapshot(kit: EvalKit, run_id: str) -> str:
     """Compute and store the run's summary (immutable; recomputable from the rows)."""
     summary = summarize(kit, run_id)
     return kit.store.save_summary(run_id, evalkit_version(), summary.to_dict())
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat()

@@ -1574,6 +1574,13 @@ Goal: make the single-record path trustworthy *before* building on it.
 | Static HTML report | §13.2, escaping + CSP |
 | Docs | ARCHITECTURE/EVALUATION-METHODOLOGY/SECURITY/DECISIONS updated to match |
 
+> **P1 implementation status.** All P1 components above are implemented except the package
+> restructure (flat layout kept; import rules enforced by a test). The list of deliberate
+> deviations, what was pulled forward from P2 and what remains is in `docs/ARCHITECTURE.md`,
+> "P1 platform: runs, execution, analysis". Measured throughput: `docs/BENCHMARK.md`. **Not yet
+> done:** validation of the judge prompt against a live model (the development credentials could not
+> invoke Bedrock).
+
 **Dependencies:** P0 (migrations, finite invariants, encoding). New third-party dependency: `jsonschema` (or a documented smaller alternative) — see §20.
 **Tests required:** unit tests per evaluator incl. hand-computed retrieval fixtures (nDCG worked examples); taxonomy mapping tests for every row of §7.4; state-machine tests for unit/run statuses; **provider contract tests** with recorded real SDK response fixtures (Bedrock/OpenAI shapes, including guardrail/filter stop reasons); comparison tests (confounder detection, exclusions, survivorship warning); **statistical simulation tests** (§9.3); calibration math tests; report escaping/XSS tests (script tags in outputs); e2e: import → run (fake target+judge) → compare → gate exit code; concurrency test at engine level (bounded in-flight never exceeds window; writer queue backpressure); migration tests for `0003+`.
 **Migration:** additive tables; `reviews` rebuild. **Acceptance:** (1) 10 K-case dataset with 3 evaluators and a zero-latency fake completes with **all rows persisted exactly once** (assert counts), at a recorded rows/s **> the 186 rows/s baseline** (number recorded in docs, not assumed); (2) killing the process mid-run then running again completes without duplicates (unique-constraint assertion); (3) `compare` on identical-identity reruns reports EQUIVALENT with noise floor; on a synthetic 5 pp degradation over ≥ 300 cases reports REGRESSION; on ≤ 20 paired cases always INCONCLUSIVE; (4) every §7.4 signal maps to the specified class in a table-driven test; (5) a run's failures are separable by class in `failures` and in the report; (6) coverage ≥ 95 % on new packages, import-direction test green; (7) report XSS test passes.

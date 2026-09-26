@@ -886,3 +886,36 @@ def test_execution_policy_defaults():
     p = ExecPolicy()
     assert (p.concurrency, p.in_flight, p.batch_size, p.on_missing) == (4, 8, 100, "abort")
     assert ExecPolicy(concurrency=3, window=10).in_flight == 10
+
+
+def test_a_systemic_failure_outranks_a_simultaneous_cancellation(kit):
+    dataset(kit, 20)
+    judge = Judge(lambda n, req: EvalFailure("infrastructure", "auth", "denied"))
+    run = create(kit, evaluators=[judge_spec(judge)], policy={"concurrency": 1})
+    token = CancelToken()
+    report = kit.controller.execute(
+        run.id, clients=[judge], token=token, on_progress=lambda n: token.cancel("user")
+    )
+    assert (report.status, report.stop_reason) == ("failed", "infrastructure.auth")
+
+
+def test_a_silently_lost_evaluator_write_never_yields_a_succeeded_run(kit):
+    """Defence in depth: even if a write vanished without an error, `succeeded` is only claimed
+    when every evaluator has a result for every finished case."""
+    dataset(kit, 6)
+    run = create(kit, evaluators=[EM, RX])
+    store = type(kit.store)
+    real = store.write_batch
+
+    def lossy(self, run_id, items):
+        kept = [i for i in items if not (i.kind == "evaluator" and i.case_key == "c002")]
+        return real(self, run_id, kept)
+
+    store.write_batch = lossy
+    try:
+        report = kit.controller.execute(run.id)
+    finally:
+        store.write_batch = real
+    assert (report.status, report.stop_reason) == ("partial", "incomplete")
+    assert kit.controller.execute(run.id).status == "succeeded"  # resume fills the gap
+    assert kit.runs.verify(run.id).ok

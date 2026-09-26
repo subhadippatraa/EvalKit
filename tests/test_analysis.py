@@ -399,3 +399,20 @@ def test_property_the_accounting_identity_holds_and_numbers_stay_in_range(kinds,
     json.dumps(s.to_dict(), allow_nan=False)
     assert all(math.isfinite(x) for x in [s.target_failure_rate or 0.0, s.case_coverage or 0.0])
     kit.close()
+
+
+def test_an_interval_depends_on_the_values_not_on_the_order_they_were_stored():
+    """Regression: rows come back in arbitrary (random-id) order; a seeded bootstrap over an
+    unsorted list changed with it, so 'reproducible' reports were not."""
+    import random
+
+    from evalkit.analysis import summarize_metric
+
+    rng = random.Random(9)
+    values = [rng.random() for _ in range(40)]
+    assert len(set(values)) == 40
+    reference = summarize_metric("m", values, reliable=True, seed=3)
+    for i in range(20):
+        shuffled = values[:]
+        random.Random(i).shuffle(shuffled)
+        assert summarize_metric("m", shuffled, reliable=True, seed=3) == reference

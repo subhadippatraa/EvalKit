@@ -13,3 +13,7 @@ build/
 *.db.bak-*
 *.db.spill/
 .hypothesis/
+.coverage
+quickstart.db*
+examples/quickstart/compare.json
+examples/quickstart/report.html

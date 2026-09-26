@@ -583,3 +583,73 @@ evaluator orchestration yet; the single-record `Evaluator` API is unchanged and 
 
 CLI: `evalkit dataset import NAME FILE | list | show REF [--cases N] | export REF FILE [--force] |
 lint REF | verify REF`.
+
+
+## P1 platform: runs, execution, analysis
+
+The remaining P1 slices of [`TARGET-ARCHITECTURE.md`](TARGET-ARCHITECTURE.md), built on the dataset
+foundation. Still one process and one SQLite file; the single-record `Evaluator` API is unchanged.
+
+| Module | Role |
+|---|---|
+| `failures.py` | `FailureClass` (input / target / evaluator / infrastructure), the kind table, `Failure`, `EvalFailure` |
+| `runs.py` | pure domain: `RunConfig` (identity vs exec hash), `Run`, `CaseOutcome`/`CaseResult`, `EvaluatorOutcome`/`EvaluatorResult`, `RunAttempt`, `RunService` |
+| `run_store.py`, `analysis_store.py` | SQL for runs/results and for analysis reads, tags, reviews, summaries, judge checks (mixins on `SQLiteStore`) |
+| `llm.py`, `judge_eval.py` | transport contract (`LLMClient`) and judge semantics over it; `bedrock.py` / `bedrock_openai.py` are the only SDK importers |
+| `calls.py` | retry policy, backoff, timeouts, rate limiter, breaker / budget guard, `UnitCalls` (an attempt per call) |
+| `targets.py`, `evaluators.py` | the four targets; six evaluators and the registry (`resolve()` makes a spec canonical so its key names its behaviour) |
+| `engine.py` | `ExecPolicy`, preflight, `ResultWriter` (single writer, batches, spill), `RunController` |
+| `stats.py`, `analysis.py` | stdlib statistics; aggregation with denominators / coverage |
+| `compare.py` | paired comparison, confounders, decision rule, `Gates`, baselines by tag |
+| `calibration.py`, `judgecheck.py` | reviews, calibration, queues, disagreement; golden-set judge check |
+| `report.py`, `cli_platform.py`, `env.py` | static HTML report; CLI handlers; clients from environment variables |
+
+Invariants the database enforces (migration 4), independent of the Python code:
+
+- A run pins one *sealed* dataset version; its config, identity, evaluator set and creation time
+  are frozen. Status changes follow the lifecycle (`created → running → succeeded | partial |
+  cancelled | failed`, and resume) and a run cannot succeed until every case has a terminal result.
+- Results are write-once and only accepted while the run is `running`; a case result must belong
+  to the run's dataset version; an evaluator result must carry its case result's run and one of the
+  run's registered evaluators.
+- **A target failure is never scored**: a failed case result accepts only `skipped` evaluator
+  results, and `failure_class` sets are disjoint by level (case: input | target | infrastructure;
+  evaluator: input | evaluator | infrastructure).
+- Metrics are finite and only attach to `ok` results; attempts have exactly one owner and a failure
+  class that fits what was called. Nothing is ever updated or deleted.
+
+CHECK constraints are written so a NULL cannot slip through (a CHECK that evaluates to NULL passes);
+each has a raw-SQL test including the NULL cases. `verify` recomputes hashes and relationships to
+detect changes made by a writer that bypassed the triggers.
+
+**Execution model.** `create` (preflight, freeze, plan with a seeded order) → `execute`: a producer
+pages pending units by `(ord, id)` keeping at most `window` in flight; each unit runs the target then
+every evaluator independently; results go through one writer thread that commits batches. Cancellation
+and budgets stop dispatch (in-flight units finish); systemic failures stop the run as `failed`, a
+tripped breaker as `partial`. Resume repairs half-finished units and finishes pending ones; terminal
+results are never redone. On a persistent storage failure the unwritten results are appended to
+`<db>.spill/<run>.jsonl` and replayed first on the next execute.
+
+**Deviations from `TARGET-ARCHITECTURE.md`** (each a decision, not an accident):
+
+1. *Flat module layout* instead of the sub-package restructure; the import-direction rules of §2.1 are
+   enforced by `tests/test_architecture.py` on the flat layout. No compatibility shims were needed.
+2. `CaseResult.status` is `pending | complete | failed` plus `(failure_class, kind, retryable)` columns,
+   not `claimed | target_failed | retryable`; `claimed`, `worker_id` and `lease_expires_at` are P2 (leases).
+   `ord` (seeded order) was added. No `runs.source_run_id`: a `reuse` target keeps it in its identity.
+   No `cancel_requested` column (cancellation is in-process).
+3. `succeeded` means every case reached a terminal result; **coverage is enforced by gates**
+   (`Gates.min_coverage`), not by the run status.
+4. *Pulled forward from P2 at the request of the P1 brief, in minimal form:* a rate limiter
+   (fixed spacing), a consecutive-failure breaker, token / call / duration budgets, `citation_check`.
+   *Not* pulled forward: adaptive concurrency, the response cache, USD price tables (prices are a
+   caller-supplied mapping used only for an estimate), attempt columns for queue-wait / backoff / cost /
+   cache-hit, leases, workers, `--retry-failed`.
+5. Provider mapping: a *target* whose provider rejects the request is `input.bad_config` (the design's
+   `target.bad_config` is not in its own kind table); `infrastructure.internal_error` was added for bugs
+   in EvalKit itself; `input.bad_config` is systemic. A truncated *target* answer is kept as an answer
+   (flagged), not a failure.
+6. `json_schema` is an optional extra (`evalkit[jsonschema]`), as §20 recommends.
+7. Run summaries are appended as history (one snapshot per execute), not a single row.
+8. Migration 4 was still unreleased when `ord` and `evaluator_count` were added, so it was edited
+   in place (released migrations 1-2 are untouched; a test pins every checksum).

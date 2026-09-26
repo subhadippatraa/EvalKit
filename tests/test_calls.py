@@ -137,6 +137,11 @@ def test_retries_follow_the_design_table(f, expected):
     assert RetryPolicy().retries_for(f) == expected
 
 
+def test_a_systemic_failure_is_never_retried_even_if_it_claims_to_be_retryable():
+    f = fail("infrastructure", "auth", retryable=True)
+    assert f.retryable and f.systemic and RetryPolicy().retries_for(f) == 0
+
+
 def test_max_attempts_caps_every_kind():
     assert RetryPolicy(max_attempts=2).retries_for(fail("infrastructure", "rate_limited")) == 1
     assert RetryPolicy(max_attempts=1).retries_for(fail("infrastructure", "rate_limited")) == 0

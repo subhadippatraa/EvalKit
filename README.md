@@ -13,9 +13,14 @@ summarization, extraction, code generation), so projects just install it.
   reviews per evaluation.
 - The **CLI** is a thin wrapper over the library.
 
-Out of scope: retrieval metrics (recall/MRR/nDCG), batch/dataset management, dashboards,
-HTTP APIs. v1 ships one judge provider: **AWS Bedrock**. Design details:
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Beyond scoring one record, evalkit is a small **single-process evaluation platform** backed by
+SQLite: versioned datasets, runs over them, pluggable targets and evaluators (deterministic checks,
+retrieval metrics, an LLM judge), honest aggregation, paired run-vs-run comparison with regression
+gates, human calibration, and a self-contained HTML report. See
+[Evaluation platform](#evaluation-platform). It is *not* a distributed system, a dashboard or an
+HTTP service (see [Limitations](#limitations)). Providers: **AWS Bedrock** (Converse) and Bedrock's
+OpenAI-compatible endpoint. Design details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
+[`docs/TARGET-ARCHITECTURE.md`](docs/TARGET-ARCHITECTURE.md).
 
 ## Install
 
@@ -248,6 +253,147 @@ for case in kit.datasets.cases("support-qa@latest"):
 - **Content is stored losslessly** (no escaping or normalization) and hashed canonically; the
   database itself refuses to update or delete sealed data, and `dataset verify` detects tampering.
 
+## Evaluation platform
+
+```text
+Dataset ─► DatasetVersion (immutable) ─► Run (frozen config) ─► per case: Target ─► CaseResult
+                                                                        └─► Evaluator(s) ─► EvaluatorResult (+ metrics, attempts)
+Run ─► summary (coverage, CIs, failures) ─► compare (paired, gated) ─► static HTML report
+```
+
+A quick tour lives in [`examples/quickstart`](examples/quickstart) (`bash run.sh`, also under test).
+
+**Run.** `evalkit runs create DATASET --config spec.toml` runs *preflight* (every case has what each
+evaluator needs; bad config; unpinned targets; dataset lint; contamination), freezes the config
+against one exact dataset version, and plans one pending result per case. `evalkit runs execute RUN`
+executes it: a bounded window of cases on a thread pool, one writer committing batches, cases in a
+seeded hash order (a run that stops early has processed an unbiased sample, not a prefix).
+
+```toml
+# spec.toml
+[target]                       # precomputed (default) | reuse | callable | model
+kind = "callable"
+callable = "mypkg.rag:answer"  # trusted code, imported from this file/flag only
+fingerprint = "git:3f2a9c1"    # you declare what you test; without it the run is "unpinned"
+
+[[evaluators]]
+kind = "exact_match"           # exact_match | regex | json_schema | retrieval | citation_check | llm_judge
+name = "answer"
+params = { normalize = ["strip", "casefold"] }
+
+[[evaluators]]
+kind = "llm_judge"
+name = "quality"
+params = { rubric = { criteria = [{ name = "correctness", description = "Is it correct?", must_pass = true }] } }
+
+[policy]                       # execution only: never part of a run's identity
+concurrency = 4
+retry = { max_attempts = 4, base_s = 1.0, cap_s = 30.0, timeout_s = 60.0 }
+budget = { max_tokens = 2000000, max_calls = 50000, max_duration_s = 3600 }
+```
+
+**Targets** produce the output being scored. `precomputed`: the dataset's own `output`.
+`reuse`: outputs copied from an earlier run (re-score with new evaluators at zero target cost).
+`callable`: a Python function `(TargetInput) -> str | TargetOutput`. `model`: a prompt template over
+an LLM client. A target sees only `prompt`/`context`: **never the reference, relevance labels, tags or
+metadata**. Every external call is an *attempt* (latency, tokens, request id, error, kept evidence).
+
+**Evaluators.** `exact_match` (declared normalization), `regex`, `json_schema` (optional extra:
+`pip install 'evalkit[jsonschema]'`; remote `$ref` is refused), `retrieval` (recall/precision/hit/MRR/nDCG
+exactly as specified in the design), `citation_check` (structure only: it does not judge whether a
+cited document supports a claim), `llm_judge` (rubric + must-pass criteria). There is deliberately no
+BLEU/ROUGE/embedding-similarity evaluator. An evaluator's identity (`kind:name:hash`) covers every
+parameter, its version and, for judges, the rubric hash, model and prompt fingerprint.
+
+**Failures are attributed, never scored.** Every failure has a class: `input` (case/config),
+`target` (the system under test), `evaluator` (rubric/judge), `infrastructure` (provider, storage,
+EvalKit). A target failure is a case-result failure and its evaluators are `skipped`; nothing becomes a
+zero. `evalkit runs failures RUN --class target` is the AI system's problem list.
+
+**Aggregation states its denominators.** Per evaluator: scored / not applicable / skipped /
+evaluator-failed / infrastructure-failed / input-excluded / missing, `coverage = scored / (cases −
+not_applicable)`, means with intervals (Wilson for proportions, seeded bootstrap otherwise), pass rate
+with bounds for UNCERTAIN verdicts, latency, tokens, slices by tag. **Below the required coverage the
+headline value is withheld** (the observed mean stays visible and flagged).
+
+**Stopping and resuming.** Ctrl-C (or `CancelToken`) stops dispatch and lets in-flight cases finish;
+budgets, a tripped provider breaker and systemic failures (auth, bad model id) stop the run as
+`cancelled` / `partial` / `failed`, keeping every result. `evalkit runs resume RUN` finishes what is
+left, including cases whose evaluators were interrupted by a crash. If storage itself fails,
+unwritten results are spilled to `<db>.spill/<run>.jsonl` and replayed on the next execute.
+
+**Comparing runs fairly.** `evalkit compare CAND --baseline RUN|tag:main [--gates gates.toml]`
+pairs results by case. It refuses a *confounded* comparison (different judge model, rubric, prompt
+fingerprint, evaluator parameters, scoring version) unless `--allow-confounders`; reports excluded
+cases and a survivorship warning; and gives per metric n, the paired difference with a 95% interval,
+the minimum detectable difference, higher/lower/tied counts and (for proportions) an exact McNemar
+p-value. Each declared gate decides REGRESSION / IMPROVEMENT / EQUIVALENT / INCONCLUSIVE from the
+interval against your tolerance; fewer than 30 pairs is always INCONCLUSIVE, and a candidate below
+the minimum coverage cannot pass. Exit codes: `0` pass, `1` error, `2` usage, `3` gate failed, `4`
+inconclusive under `--strict`.
+
+```toml
+# gates.toml: only declared gates can fail a build
+min_coverage = 0.95
+[gates]
+"exact_match:answer.match" = { direction = "higher", delta = 0.02 }
+"run.target_failure_rate"  = { direction = "lower",  delta = 0.005 }
+"run.latency_p95_ms"       = { direction = "lower",  rel_delta = 0.25 }
+[gates.floor]
+"exact_match:answer.match" = 0.90
+```
+
+**A judge is an instrument, not truth.** `evalkit runs review ... --sample random` records human
+verdicts; `runs calibrate` reports accuracy, FAIL-precision/recall, Cohen's kappa and reviewer
+agreement from random-sample reviews only (`UNCALIBRATED` below 30). `runs queue` offers unbiased
+(`random`, `stratified`) or triage (`uncertain`, `disagreement`) review queues, and
+`runs disagreements` compares evaluators per case. `evalkit judge-check` runs a golden set with
+adversarial cases (hidden instructions, verbosity padding, forged delimiters, injected context)
+through the configured judge and stores its accuracy per evaluator key.
+
+**Report.** `evalkit report RUN --out report.html [--compare tag:main --gates gates.toml]` writes one
+static file (inline CSS, no JavaScript, no network, CSP `default-src 'none'`); all case text, model
+output and error messages are escaped. It shows the run header and frozen config, the summary with
+denominators and intervals, the failure breakdown by class, judge trust, the comparison and gate with
+its reasoning, and per-case evidence (input, target output, evaluator results, attempts, failures).
+
+```python
+from evalkit import EvalKit, EvaluatorSpec
+from evalkit.targets import CallableTarget
+from evalkit.compare import compare, Gates, evaluate_gates
+
+kit = EvalKit.open("evalkit.db")
+kit.datasets.import_jsonl("support-qa", "cases.jsonl")
+target = CallableTarget(my_pipeline, name="rag", fingerprint="git:3f2a9c1")
+run = kit.controller.create("support-qa", target=target,
+                            evaluators=[EvaluatorSpec(kind="exact_match", name="answer")])
+report = kit.controller.execute(run.id, target=target)     # report.status, .counts, .spend
+summary = kit.summarize(run.id)                             # coverage, metrics with CIs, failures
+cmp = compare(kit, baseline_run_id, run.id)
+gate = evaluate_gates(kit, run.id, Gates.from_file("gates.toml"), cmp)   # gate.exit_code
+```
+
+### Limitations
+
+- **One process, one SQLite file** on a local filesystem. Threads, not workers: no multi-process or
+  multi-host execution, no leases. Measured numbers are in [`docs/BENCHMARK.md`](docs/BENCHMARK.md);
+  nothing here claims distributed or 1M-case production scale.
+- **Not in P1** (designed for P2): retrying *failed* results on resume (`--retry-failed`; terminal
+  results are write-once), adaptive concurrency, per-provider limiter tables, the LLM response
+  cache, USD-priced budgets (budgets are tokens / calls / duration; cost is an estimate from
+  user-supplied prices), `evalkit gc`, samples-per-case self-consistency, run cancellation from another
+  process, structured logging/metrics export.
+- **Callable targets are trusted code** with full process privileges, are timed out but not killed
+  (a timed-out function keeps running in its thread), and may be called twice for one case (a timeout
+  is retried once): make them safe to call twice. There is no `http` target.
+- **LLM judges can be talked into a score**; injection is made detectable (golden set, calibration,
+  deterministic evaluators), not preventable. The built-in golden set is small and hand-labelled.
+  **Live validation of the judge prompt against a real model is still pending**: the credentials
+  available while developing could not invoke Bedrock models (`ValidationException: Operation not
+  allowed`), so the provider clients and prompts are tested against recorded-shape fakes only.
+- Statistics are stdlib-only and stated with their limits: a 60-case dataset cannot show a change
+  smaller than about 10 points (comparisons print the minimum detectable difference).
+
 ## Human review
 
 Any evaluation, including failed ones, can have any number of reviews. A review has a
@@ -268,6 +414,13 @@ evalkit get <id>                         # one evaluation + its reviews
 evalkit list [--tag X] [--limit N] [--cursor C]   # newest first; next_cursor on stderr
 evalkit recover                          # save results a failed database write left behind
 evalkit review <id> --reviewer alice --verdict PASS [--score 0.9] [--comment "..."]
+
+evalkit dataset import|list|show|export|lint|verify ...        # versioned datasets
+evalkit runs create|execute|resume|list|show|failures|verify ... # runs (platform)
+evalkit runs tag|review|calibrate|queue|disagreements ...       # baselines, human calibration
+evalkit compare CAND --baseline RUN|tag:NAME [--gates FILE] [--strict] [--allow-confounders]
+evalkit report RUN --out report.html [--compare BASELINE] [--gates FILE] [--max-cases N] [--force]
+evalkit judge-check [--cases FILE] [--rubric FILE] [--min-accuracy X]
 ```
 
 `input.json` uses the same keys as `evaluate()`; `rubric` may be given as a JSON object:
@@ -287,6 +440,8 @@ Exit codes:
 - `0`: success, including a `FAIL` verdict.
 - `1`: evaluation or library error. The message and any stored `evaluation_id` go to stderr.
 - `2`: usage error or unreadable input file.
+- `3`: a declared gate failed (`compare`, `judge-check --min-accuracy`). `4`: gate inconclusive under `--strict`.
+  A run that did not complete (`runs execute` on a partial/failed/cancelled run) exits `1`.
 
 `run` needs judge configuration. `get`, `list` and `review` only need `EVALKIT_DB_PATH`.
 
@@ -389,6 +544,9 @@ None` (with `.reviews` populated), `list(tag=None, limit=20)` and `add_review(re
 ```bash
 uv run pytest            # no network or AWS calls: fake judges + stubbed Bedrock client
 uv run ruff check . && uv run ruff format --check .
+uv run --with coverage coverage run --branch --source=evalkit -m pytest -q && uv run --with coverage coverage report
+uv run python scripts/mutation.py     # ~100 targeted mutants of the invariants; every one must be killed
+uv run python scripts/benchmark.py --cases 10000    # local throughput; see docs/BENCHMARK.md
 ```
 
 A real Bedrock smoke test is manual. With AWS credentials and model access configured, run
