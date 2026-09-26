@@ -4,7 +4,7 @@ import threading
 from collections import Counter
 
 import pytest
-from conftest import EM, JUDGE, case, ok
+from conftest import EM, JUDGE, case, ok, settle
 
 from evalkit import (
     CaseOutcome,
@@ -104,6 +104,7 @@ def test_racing_lifecycle_transitions_only_one_finishes_the_run(kit, big):
     kit.runs.plan(big.id)
     for i in range(N):
         kit.runs.record_case_result(big.id, f"c{i:03}", CaseOutcome.complete("o"))
+    settle(kit, big)
     results = race([lambda: kit.runs.transition(big.id, "succeeded") for _ in range(8)])
     assert sum(e is None for _, e in results) == 1
     assert all(isinstance(e, RunError) for _, e in results if e)

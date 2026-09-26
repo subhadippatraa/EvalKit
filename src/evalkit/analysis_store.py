@@ -96,18 +96,19 @@ class AnalysisStoreMixin:
 
     def case_outcomes(self, run_id: str) -> dict[str, dict[str, Any]]:
         """case_key -> {case: (status, class, kind), evaluators: {key: (status, class, verdict)},
-        content_hash} -- everything needed to pair and exclude cases between two runs."""
+        input_hash} -- everything needed to pair and exclude cases between two runs. `input_hash`
+        is the question side of the case (never the system's output); it is what pairing uses."""
         with self._lock:
             self._run_or_raise(run_id)
             out: dict[str, dict[str, Any]] = {}
             for r in self._conn.execute(
-                "SELECT c.case_key, c.content_hash, r.status, r.failure_class, r.failure_kind, "
+                "SELECT c.case_key, c.input_hash, r.status, r.failure_class, r.failure_kind, "
                 "r.duration_ms FROM case_results r JOIN cases c ON c.id = r.case_id "
                 "WHERE r.run_id = ?",
                 (run_id,),
             ):
                 out[r[0]] = {
-                    "content_hash": r[1],
+                    "input_hash": r[1],
                     "case": (r[2], r[3], r[4]),
                     "duration_ms": r[5],
                     "evaluators": {},

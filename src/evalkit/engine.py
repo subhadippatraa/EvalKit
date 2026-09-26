@@ -62,6 +62,7 @@ from evalkit.evaluators import (
 from evalkit.failures import EvalFailure, Failure, FailureClass
 from evalkit.llm import LLMClient
 from evalkit.models import format_validation_error
+from evalkit.runlock import RunLock
 from evalkit.runs import (
     CaseOutcome,
     EvaluatorOutcome,
@@ -107,6 +108,12 @@ class ExecPolicy:
     seed: int = 0  # processing order
     on_missing: Literal["abort", "not_applicable"] = "abort"
     breaker_threshold: int = 10
+    # consecutive failures of one systemic kind (auth, a rejected request, quota) from one provider
+    # and model, with no success in between, that stop the run (design 8.4); one is not enough
+    systemic_threshold: int = 3
+    # a run whose evaluators scored less than this share of their applicable cases does not
+    # succeed (it stops `partial(insufficient_coverage)`); it must always have scored something
+    min_coverage: float = 0.0
     max_calls_per_s: float | None = None
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     budget: Budget = field(default_factory=Budget)
@@ -121,6 +128,10 @@ class ExecPolicy:
         check("batch_size", 1, 10_000)
         check("batch_ms", 1, 60_000)
         check("breaker_threshold", 1, 10_000)
+        check("systemic_threshold", 1, 10_000)
+        mc = self.min_coverage
+        if isinstance(mc, bool) or not isinstance(mc, int | float) or not 0.0 <= mc <= 1.0:
+            raise ValueError("min_coverage must be a number within [0, 1]")
         if self.window is not None:
             check("window", self.concurrency, 10_000)
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -214,6 +225,8 @@ class ExecutionReport:
     spend: SpendTotals
     spilled: int = 0
     worker_errors: int = 0
+    writer_error: str | None = None  # why the result writer stopped, if it did
+    stop_detail: str | None = None  # the message of the failure that stopped the run, if any
 
     @property
     def status(self) -> str:
@@ -252,7 +265,13 @@ def _line_item(line: str) -> WriteItem:
 
 
 class ResultWriter:
-    """The single writer: batches results into one transaction each (design 8.1/11.1)."""
+    """The single writer: batches results into one transaction each (design 8.1/11.1).
+
+    A *group* of items (`put(a, b, c)`) is never split across transactions: a failed target and its
+    `skipped` evaluator rows are stored together or not at all. The writer thread cannot die
+    silently: any exception (a storage error, or a bug) is recorded in `failed`, what it held and
+    what is still queued is spilled to disk, and every later `put` refuses instead of blocking, so
+    the executor always learns of it and stops (audit P1-4)."""
 
     def __init__(
         self,
@@ -272,20 +291,28 @@ class ResultWriter:
         self.written = 0
         self.duplicates = 0
         self.spilled = 0
+        self.lost = 0  # results that could neither be stored nor spilled (both failed)
         self.spilled_items: list[WriteItem] = []  # in-memory stores have no spill directory
         self._closing = threading.Event()
+        self._batch: list[tuple[WriteItem, ...]] = []  # what the thread holds right now
         self._thread.start()
 
-    def put(self, item: WriteItem) -> bool:
-        """Queue a result (blocks when the writer is behind: backpressure). False once the
-        writer has given up; the caller then knows its result was NOT queued."""
-        while self.failed is None:
+    @property
+    def crashed(self) -> bool:
+        """The writer stopped on something other than a storage error: a bug."""
+        return self.failed is not None and not isinstance(self.failed, sqlite3.Error | RunError)
+
+    def put(self, item: WriteItem, *more: WriteItem) -> bool:
+        """Queue a result group (blocks when the writer is behind: backpressure). False once the
+        writer has given up or been closed; the group is then spilled, not queued."""
+        group = (item, *more)
+        while self.failed is None and not self._closing.is_set():
             try:
-                self._queue.put(item, timeout=0.1)
+                self._queue.put(group, timeout=0.1)
                 return True
             except queue.Full:
                 continue
-        self._spill([item])
+        self._spill(list(group))
         return False
 
     def close(self) -> None:
@@ -296,8 +323,19 @@ class ResultWriter:
         except queue.Full:
             pass  # the loop also stops on its own once closing is set and the queue is empty
         self._thread.join()
+        self._drain()  # a group queued in the instant before closing must not be dropped
 
     def _loop(self) -> None:
+        try:
+            self._run()
+        except BaseException as e:  # noqa: BLE001 - nothing may kill this thread unrecorded
+            log.error("the result writer stopped unexpectedly: %r", e)
+            self.failed = e
+            held, self._batch = self._batch, []
+            self._spill([i for g in held for i in g])
+            self._drain()
+
+    def _run(self) -> None:
         while True:
             try:
                 first = self._queue.get(timeout=0.1)
@@ -308,9 +346,10 @@ class ResultWriter:
             if first is _SENTINEL:
                 return
             batch = [first]
+            size = len(first)
             deadline = time.monotonic() + self._batch_s
             stop = False
-            while len(batch) < self._batch_size:
+            while size < self._batch_size:
                 try:
                     item = self._queue.get(timeout=max(0.0, deadline - time.monotonic()))
                 except queue.Empty:
@@ -319,19 +358,23 @@ class ResultWriter:
                     stop = True
                     break
                 batch.append(item)
+                size += len(item)
+            self._batch = batch
             self._flush(batch)
+            self._batch = []
             if stop:
                 return
 
-    def _flush(self, batch: list[WriteItem]) -> None:
+    def _flush(self, batch: list[tuple[WriteItem, ...]]) -> None:
         if self.failed is not None:
-            self._spill(batch)
+            self._spill([i for g in batch for i in g])
             return
+        items = [i for g in batch for i in g]
         delay = 0.05
         for attempt in range(self._retries + 1):
             try:
-                self._store.write_batch(self._run_id, batch)
-                self.written += len(batch)
+                self._store.write_batch(self._run_id, items)
+                self.written += len(items)
                 return
             except sqlite3.OperationalError as e:  # locked / busy / disk I/O: transient or fatal
                 if attempt == self._retries:
@@ -340,49 +383,58 @@ class ResultWriter:
                 time.sleep(delay)
                 delay *= 2
             except (RunError, sqlite3.Error):
-                self._one_by_one(batch)  # one bad item must not lose the others
+                self._one_by_one(batch)  # one bad group must not lose the others
                 return
 
-    def _one_by_one(self, batch: list[WriteItem]) -> None:
-        for i, item in enumerate(batch):
+    def _one_by_one(self, batch: list[tuple[WriteItem, ...]]) -> None:
+        for i, group in enumerate(batch):
             try:
-                self._store.write_batch(self._run_id, [item])
-                self.written += 1
+                self._store.write_batch(self._run_id, list(group))
+                self.written += len(group)
             except DuplicateResultError:
-                self.duplicates += 1  # already stored (e.g. by a crashed earlier attempt)
+                self.duplicates += len(group)  # already stored (e.g. by a crashed earlier attempt)
             except (RunError, sqlite3.Error) as e:
                 self._fail(e, batch[i:])
                 return
 
-    def _fail(self, error: BaseException, items: list[WriteItem]) -> None:
-        log.error("result storage failed (%s); spilling %d result(s)", error, len(items))
+    def _fail(self, error: BaseException, batch: list[tuple[WriteItem, ...]]) -> None:
+        log.error("result storage failed (%s); spilling %d group(s)", error, len(batch))
         self.failed = error
-        self._spill(items)
+        self._spill([i for g in batch for i in g])
         self._drain()
 
     def _drain(self) -> None:
         while True:
             try:
-                item = self._queue.get_nowait()
+                group = self._queue.get_nowait()
             except queue.Empty:
                 return
-            if item is not _SENTINEL:
-                self._spill([item])
+            if group is not _SENTINEL:
+                self._spill(list(group))
 
     def _spill(self, items: list[WriteItem]) -> None:
+        if not items:
+            return
         directory = getattr(self._store, "spill_dir", None)
         self.spilled += len(items)
         if directory is None:
             self.spilled_items.extend(items)
             return
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = directory / f"{self._run_id}.jsonl"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
-            for item in items:
-                f.write(_item_line(item) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        try:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = directory / f"{self._run_id}.jsonl"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                for item in items:
+                    f.write(_item_line(item) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as e:  # the spill failed too (disk full?): say so, never raise from here
+            self.spilled -= len(items)
+            self.lost += len(items)
+            log.error(
+                "could not spill %d result(s) either (%s); they will be re-run", len(items), e
+            )
 
 
 # ---- the controller -------------------------------------------------------------------------
@@ -432,6 +484,8 @@ class RunController:
             ExecPolicy.from_mapping(policy or {})
         except (ValueError, TypeError) as e:
             error("bad_config", f"invalid execution policy: {e}")
+        if not evaluators:
+            error("no_evaluators", "a run needs at least one evaluator: it would measure nothing")
         specs: list[EvaluatorSpec] = []
         for spec in evaluators:
             try:
@@ -613,7 +667,11 @@ class RunController:
         """Execute (or resume) a run and return what happened. See the module docstring.
 
         `overrides` adjusts execution settings for this call only (e.g. a raised budget to resume
-        a run that stopped on it); they are not persisted and never affect the run's identity."""
+        a run that stopped on it); they are not persisted and never affect the run's identity.
+
+        One executor per run: a second `execute` on a run that is being executed (in this process
+        or another on this host) raises `RunBusyError` and makes no call. The lock dies with its
+        holder, so a crashed executor never blocks the recovery of its run."""
         started = time.monotonic()
         run = self.runs.get(run_id)
         if run.status == "succeeded":
@@ -625,13 +683,32 @@ class RunController:
         evaluators = [build(spec, EvalContext(tuple(clients))) for spec in run.config.evaluators]
         tgt = self._target_for(run, target)  # config problems surface before any state change
 
+        with RunLock(self.store.lock_dir, run_id, self.store.lock_scope):
+            run = self.runs.get(run_id)  # re-read: the previous holder may have just finished
+            if run.status == "succeeded":
+                raise RunError(f"run {run_id} already succeeded")
+            return self._execute_locked(run, policy, tgt, evaluators, token, on_progress, started)
+
+    def _execute_locked(
+        self,
+        run: Run,
+        policy: ExecPolicy,
+        tgt: Target,
+        evaluators: list[CaseEvaluator],
+        token: CancelToken | None,
+        on_progress: Callable[[int], None] | None,
+        started: float,
+    ) -> ExecutionReport:
+        run_id = run.id
         if run.status != "running":
             run = self.runs.start(run_id)
         self.replay_spill(run_id)
         self.runs.plan(run_id, seed=policy.seed)
 
         token = token or CancelToken()
-        guard = RunGuard(policy.budget, policy.breaker_threshold)
+        guard = RunGuard(
+            policy.budget, policy.breaker_threshold, systemic_threshold=policy.systemic_threshold
+        )
         limiter = RateLimiter(policy.max_calls_per_s) if policy.max_calls_per_s else None
         runner = CallRunner(policy.retry, token=token, guard=guard, limiter=limiter)
         writer = ResultWriter(
@@ -647,15 +724,17 @@ class RunController:
         worker_errors = 0
         in_flight: set[Future[None]] = set()
 
-        def reap(done: set[Future[None]]) -> None:
+        def reap(done: set[Future[None]], notify: bool = True) -> None:
             nonlocal processed, worker_errors
             for f in done:
                 in_flight.discard(f)
+                if f.cancelled():
+                    continue
                 processed += 1
                 if f.exception() is not None:  # _process handles its own errors; this is a bug
                     worker_errors += 1
                     log.error("unit crashed: %r", f.exception())
-                if on_progress is not None:
+                if notify and on_progress is not None:
                     on_progress(processed)
 
         def stop() -> tuple[str, str] | None:
@@ -666,7 +745,9 @@ class RunController:
             if guard.abort is not None:
                 return guard.abort
             if writer.failed is not None:
-                return "partial", "infrastructure.storage"
+                return "partial", (
+                    "infrastructure.internal_error" if writer.crashed else "infrastructure.storage"
+                )
             if worker_errors:
                 return "partial", "infrastructure.internal_error"
             if (reason := guard.budget_stop()) is not None:
@@ -674,9 +755,9 @@ class RunController:
             return None
 
         halted: tuple[str, str] | None = None
-        with ThreadPoolExecutor(
-            max_workers=policy.concurrency, thread_name_prefix="evalkit"
-        ) as pool:
+        interrupted: BaseException | None = None
+        pool = ThreadPoolExecutor(max_workers=policy.concurrency, thread_name_prefix="evalkit")
+        try:
             for unit in self._units(run_id, len(evaluators)):
                 while len(in_flight) >= policy.in_flight:
                     done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
@@ -687,30 +768,52 @@ class RunController:
             if in_flight:
                 done, _ = wait(in_flight)
                 reap(done)
+        except BaseException as e:  # noqa: BLE001 - Ctrl-C or a bug: still flush and stop cleanly
+            interrupted = e
+            token.cancel("interrupted" if isinstance(e, KeyboardInterrupt) else "internal_error")
+            pool.shutdown(wait=False, cancel_futures=True)  # queued units are dropped...
+            running = [f for f in in_flight if not f.cancelled()]
+            # ...running ones get a bounded grace period to finish and be recorded
+            wait(running, timeout=policy.retry.timeout_s + 5)
+            reap({f for f in running if f.done()}, notify=False)
+        else:
+            pool.shutdown(wait=True)
+        # a systemic failure that never repeated was that case's own failure: record it now; one
+        # that stopped the run is dropped, leaving its cases pending for the resume
+        stopped_systemic = guard.abort is not None and guard.abort[0] == "failed"
+        ctx.settle_held(record=not stopped_systemic)
         writer.close()
         halted = stop() or halted
+        if interrupted is not None and (halted is None or halted[0] != "failed"):
+            halted = (
+                ("cancelled", "interrupted")
+                if isinstance(interrupted, KeyboardInterrupt)
+                else ("partial", "infrastructure.internal_error")
+            )
 
         counts = self.runs.counts(run_id)
-        complete_or_failed = counts.complete + counts.failed
-        finished = (
-            halted is None
-            and counts.pending == 0
-            and counts.missing == 0
-            and all(
-                sum(counts.evaluator_results.get(spec.key, {}).values()) == complete_or_failed
-                for spec in run.config.evaluators
-            )
-        )
-        if finished:
-            final = self.runs.transition(run_id, "succeeded")
-            reason = None
-        else:
-            status, reason = halted or ("partial", "incomplete")
-            final = self.runs.transition(run_id, status, stop_reason=reason)
+        reason: str | None = None
+        final = self.runs.get(run_id)
         try:
-            self.kit.snapshot(final.id)
-        except Exception:  # noqa: BLE001 - a summary problem must not lose the execution report
-            log.exception("could not store the run summary snapshot (recompute with summarize())")
+            if halted is None and self._complete(counts, run, policy):
+                final = self.runs.transition(run_id, "succeeded")
+            else:
+                if halted is None:
+                    halted = self._incomplete_reason(counts, run)
+                status, reason = halted
+                final = self.runs.transition(run_id, status, stop_reason=reason)
+            try:
+                self.kit.snapshot(final.id)
+            except Exception:  # noqa: BLE001 - a summary problem must not lose the report
+                log.exception(
+                    "could not store the run summary snapshot (recompute with summarize())"
+                )
+        except Exception:
+            if interrupted is None:
+                raise
+            log.exception("could not record the stop of an interrupted run")
+        if interrupted is not None:
+            raise interrupted
         return ExecutionReport(
             run=final,
             counts=self.runs.counts(run_id),
@@ -720,11 +823,47 @@ class RunController:
             spend=guard.usage,
             spilled=writer.spilled,
             worker_errors=worker_errors,
+            writer_error=None
+            if writer.failed is None
+            else f"{type(writer.failed).__name__}: {writer.failed}",
+            stop_detail=guard.abort_detail if stopped_systemic else None,
         )
 
+    # -- what "succeeded" means -------------------------------------------------------------
+
+    @staticmethod
+    def _complete(counts: RunCounts, run: Run, policy: ExecPolicy) -> bool:
+        """Every case terminal, every evaluator has a result for each of them (the database
+        insists too), and every evaluator actually *scored* enough of what it could score: a run
+        in which nothing was measured has not succeeded, however many rows it stored."""
+        terminal = counts.complete + counts.failed
+        if counts.pending or counts.missing or not run.config.evaluators:
+            return False
+        for spec in run.config.evaluators:
+            states = counts.evaluator_results.get(spec.key, {})
+            if sum(states.values()) != terminal:
+                return False
+            scored = states.get("ok", 0)
+            applicable = counts.total_cases - states.get("not_applicable", 0)
+            if scored == 0 or scored / applicable < policy.min_coverage:
+                return False
+        return True
+
+    @staticmethod
+    def _incomplete_reason(counts: RunCounts, run: Run) -> tuple[str, str]:
+        """Why a run that was not stopped by anything ended without succeeding."""
+        terminal = counts.complete + counts.failed
+        results_complete = all(
+            sum(counts.evaluator_results.get(spec.key, {}).values()) == terminal
+            for spec in run.config.evaluators
+        )
+        if not counts.pending and not counts.missing and results_complete and run.config.evaluators:
+            return "partial", "insufficient_coverage"
+        return "partial", "incomplete"
+
     def _units(self, run_id: str, n_evaluators: int) -> Iterator[Unit]:
-        """Units still owed: complete results missing evaluator results first (crash recovery,
-        enumerated up front), then pending ones in processing order, keyset-paged."""
+        """Units still owed: terminal case results missing evaluator results first (crash
+        recovery, enumerated up front), then pending ones in processing order, keyset-paged."""
         yield from self.store.pending_units(run_id, n_evaluators)
         after: tuple[int, str] | None = None
         while True:
@@ -743,40 +882,101 @@ class _Exec:
         self.run, self.policy, self.target = run, policy, target
         self.evaluators: list[CaseEvaluator] = evaluators
         self.runner, self.writer, self.store, self.limits = runner, writer, store, limits
+        # results of systemic-looking failures wait here until a later success of the same provider
+        # and model shows the failure was that case's own (see RunGuard)
+        self._held: list[tuple[tuple[str | None, str | None], int, tuple[WriteItem, ...]]] = []
+        self._held_lock = threading.Lock()
+
+    # -- systemic failures: record only once they are known to be the case's own ----------------
+
+    @staticmethod
+    def _key(attempts: Sequence[RunAttempt]) -> tuple[str | None, str | None]:
+        last = attempts[-1] if attempts else None
+        return (None, None) if last is None else (last.provider, last.model)
+
+    def _put_result(
+        self, failure: Failure | None, attempts: Sequence[RunAttempt], *items: WriteItem
+    ):
+        """Queue a result group; a systemic-looking failure is held instead (see class comment)."""
+        if failure is not None and failure.systemic:
+            key = self._key(attempts)
+            with self._held_lock:
+                self._held.append((key, self.runner.guard.success_seq(*key), items))
+            return True
+        return self.writer.put(*items)
+
+    def release_proven(self) -> None:
+        """Record held failures that a later success of the same provider and model has proven to
+        be case-specific."""
+        guard = self.runner.guard
+        with self._held_lock:
+            keep, proven = [], []
+            for entry in self._held:
+                (proven if guard.success_seq(*entry[0]) > entry[1] else keep).append(entry)
+            self._held = keep
+        for _, _, items in proven:
+            self.writer.put(*items)
+
+    def settle_held(self, *, record: bool) -> None:
+        with self._held_lock:
+            held, self._held = self._held, []
+        if not held:
+            return
+        if not record:
+            log.warning(
+                "%d result(s) of a systemic failure were not recorded; their cases stay pending",
+                len(held),
+            )
+            return
+        for _, _, items in held:
+            self.writer.put(*items)
+
+    # -- one unit ------------------------------------------------------------------------------
+
+    @staticmethod
+    def _skipped(ev: CaseEvaluator, case_key: str) -> WriteItem:
+        outcome = EvaluatorOutcome(
+            evaluator_key=ev.key, status="skipped", detail={"reason": "target failed"}
+        )
+        return WriteItem("evaluator", case_key, outcome, [])
 
     def process(self, unit: Unit) -> None:
+        try:
+            self._process(unit)
+        finally:
+            self.release_proven()
+
+    def _process(self, unit: Unit) -> None:
         case = self.store.get_case(self.run.dataset_version_id, unit.case_key)
         if case is None:  # cannot happen: units come from this dataset version
             raise RunError(f"case {unit.case_key!r} vanished")
-        done = (
-            self.store.done_evaluator_keys(unit.result_id) if unit.status == "complete" else set()
-        )
+        done = self.store.done_evaluator_keys(unit.result_id) if unit.status != "pending" else set()
         if unit.status == "pending":
             outcome, attempts = self._target_stage(case)
-            if not self.writer.put(WriteItem("case", unit.case_key, outcome, attempts)):
+            case_item = WriteItem("case", unit.case_key, outcome, attempts)
+            if outcome.failure is not None:
+                # a failed target and its skipped evaluator rows are one group: never split
+                skipped = [self._skipped(ev, unit.case_key) for ev in self.evaluators]
+                self._put_result(outcome.failure, attempts, case_item, *skipped)
                 return
-            output, retrieved, failed = (
-                outcome.output,
-                outcome.retrieved,
-                outcome.failure is not None,
-            )
+            if not self.writer.put(case_item):
+                return
+            output, retrieved, failed = outcome.output, outcome.retrieved, False
         else:
-            output, retrieved, failed = unit.output, unit.retrieved, False
-        for ev in self.evaluators:
-            if ev.key in done:
-                continue
-            if failed:
-                eo = EvaluatorOutcome(
-                    evaluator_key=ev.key, status="skipped", detail={"reason": "target failed"}
-                )
-                attempts = []
-            else:
-                einp = EvalInput(
-                    case.case_key, case.prompt, output or "", case.reference, case.context,
-                    case.relevance, retrieved,
-                )  # fmt: skip
-                eo, attempts = self._evaluate(ev, einp)
-            if not self.writer.put(WriteItem("evaluator", unit.case_key, eo, attempts)):
+            output, retrieved, failed = unit.output, unit.retrieved, unit.status == "failed"
+        pending = [ev for ev in self.evaluators if ev.key not in done]
+        if failed:  # a stranded failed case result: only its skipped rows are missing
+            if pending:
+                self.writer.put(*[self._skipped(ev, unit.case_key) for ev in pending])
+            return
+        for ev in pending:
+            einp = EvalInput(
+                case.case_key, case.prompt, output or "", case.reference, case.context,
+                case.relevance, retrieved,
+            )  # fmt: skip
+            eo, attempts = self._evaluate(ev, einp)
+            item = WriteItem("evaluator", unit.case_key, eo, attempts)
+            if not self._put_result(eo.failure, attempts, item):
                 return
 
     # -- target stage -----------------------------------------------------------------------

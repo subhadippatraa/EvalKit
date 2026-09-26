@@ -46,6 +46,7 @@ def stable_hash(domain: str, obj: Any) -> str:
 
 
 CASE_DOMAIN = "evalkit-case-v1"
+CASE_INPUT_DOMAIN = "evalkit-case-input-v1"
 DATASET_DOMAIN = "evalkit-dataset-v1"
 
 
@@ -61,3 +62,20 @@ def dataset_hash(pairs: Iterable[tuple[str, str]]) -> str:
     for case_key, case_hash in pairs:
         digest.update(f"{case_key}\t{case_hash}\n".encode())
     return digest.hexdigest()
+
+
+def case_input_hash(
+    prompt: str,
+    reference: str | None,
+    context: str | None,
+    relevance: dict[str, int] | None,
+) -> str:
+    """Hash of what a case *asks* and what counts as right: prompt, context, reference and
+    relevance labels. Deliberately NOT the system's `output`, its `retrieved` documents, nor free
+    metadata or tags (which describe an execution, not the question): two runs of different systems
+    over the same questions must pair up case by case, whatever the systems answered. Comparison
+    pairs on `(case_key, input_hash)`."""
+    return stable_hash(
+        CASE_INPUT_DOMAIN,
+        {"prompt": prompt, "context": context, "reference": reference, "relevance": relevance},
+    )

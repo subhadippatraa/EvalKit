@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from evalkit import safejson
 from evalkit.errors import DatasetError
-from evalkit.hashing import CASE_DOMAIN, stable_hash
+from evalkit.hashing import CASE_DOMAIN, case_input_hash, stable_hash
 from evalkit.limits import (
     MAX_DOC_ID_CHARS,
     MAX_DOC_IDS,
@@ -148,6 +148,11 @@ class EvaluationCase(BaseModel):
             },
         )
 
+    @property
+    def input_hash(self) -> str:
+        """Hash of the input side only (see `hashing.case_input_hash`): what comparison pairs on."""
+        return case_input_hash(self.prompt, self.reference, self.context, self.relevance)
+
     def to_record(self) -> dict[str, Any]:
         """The JSONL form: only what is set (absent == None / empty), stable field order."""
         record: dict[str, Any] = {"case_key": self.case_key, "prompt": self.prompt}
@@ -167,6 +172,7 @@ class StoredCase(EvaluationCase):
     id: str
     dataset_version_id: str
     stored_hash: str  # the content_hash recorded at import; `content_hash` recomputes it
+    stored_input_hash: str | None = None  # the input_hash recorded at import (None: not recorded)
 
 
 class Dataset(BaseModel):

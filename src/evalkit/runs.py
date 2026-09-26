@@ -578,12 +578,13 @@ class WriteItem:
 
 @dataclass(frozen=True)
 class Unit:
-    """A unit of work the executor still owes: a pending case result, or a complete one that is
-    missing evaluator results (e.g. after a crash)."""
+    """A unit of work the executor still owes: a pending case result, or a terminal one that is
+    missing evaluator results (e.g. after a crash): a complete one lacks real results, a failed one
+    lacks its `skipped` rows."""
 
     result_id: str
     case_key: str
-    status: Literal["pending", "complete"]
+    status: Literal["pending", "complete", "failed"]
     output: str | None = None
     retrieved: list[str] | None = None
 

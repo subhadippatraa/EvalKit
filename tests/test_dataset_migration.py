@@ -57,7 +57,7 @@ def test_fresh_database_gets_the_dataset_schema(tmp_path):
     }  # fmt: skip
     assert columns(path, "cases") == {
         "id", "dataset_version_id", "case_key", "content_hash", "prompt", "output", "reference",
-        "context", "retrieved_json", "relevance_json", "metadata_json", "tags_json",
+        "context", "retrieved_json", "relevance_json", "metadata_json", "tags_json", "input_hash",
     }  # fmt: skip
     assert {
         "cases_no_update", "cases_no_delete", "cases_insert_only_unsealed",

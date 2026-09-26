@@ -198,15 +198,15 @@ def test_the_database_refuses_a_case_of_another_version(kit, run, store):
     for case_id in (foreign_case, "no-such-case"):
         refuses(
             store,
-            "INSERT INTO case_results (id, run_id, case_id, status, created_at) "
-            "VALUES ('x', ?, ?, 'pending', 't')",
+            "INSERT INTO case_results (id, run_id, case_id, status, created_at, ord) "
+            "VALUES ('x', ?, ?, 'pending', 't', 1)",
             (run.id, case_id),
             match="not part of the run's dataset version",
         )
     refuses(
         store,
-        "INSERT INTO case_results (id, run_id, case_id, status, created_at) "
-        "VALUES ('x', 'no-such-run', ?, 'pending', 't')",
+        "INSERT INTO case_results (id, run_id, case_id, status, created_at, ord) "
+        "VALUES ('x', 'no-such-run', ?, 'pending', 't', 1)",
         (foreign_case,),
         match="not part of the run's dataset version|not accepting",
     )
@@ -607,6 +607,7 @@ def test_a_run_with_mixed_outcomes_keeps_every_kind_of_result_distinct(kit):
     kit.runs.start(run.id)
     c = complete(kit, run, "c")
     kit.runs.record_evaluator_result(c.id, ok(EM_KEY, 1.0))
+    kit.runs.record_evaluator_result(c.id, ok(JUDGE_KEY, 1.0))
     assert kit.runs.transition(run.id, "succeeded").status == "succeeded"
     assert kit.runs.case_result(run.id, "b").failure.kind == "blocked"
 

@@ -3,7 +3,7 @@
 import itertools
 
 import pytest
-from conftest import EM, JUDGE, RUN_CASES, case, complete, make_run, refuses
+from conftest import EM, JUDGE, RUN_CASES, case, complete, make_run, refuses, settle
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -274,6 +274,7 @@ def to(kit, run, status):
     if status == "succeeded":
         for key in RUN_CASES:
             complete(kit, run, key)
+        settle(kit, run)
         return kit.runs.transition(run.id, "succeeded")
     if status == "running":
         return kit.runs.get(run.id)
@@ -287,6 +288,7 @@ def test_the_lifecycle_of_a_successful_run(kit):
     assert running.status == "running" and running.started_at and not running.finished_at
     for key in RUN_CASES:
         complete(kit, run, key)
+    settle(kit, run)
     done = kit.runs.transition(run.id, "succeeded")
     assert done.status == "succeeded" and done.finished_at >= done.started_at
     assert done.stop_reason is None
@@ -325,6 +327,7 @@ def test_every_status_pair_matches_the_state_machine(kit, store, old, new):
         if new == "succeeded":
             for key in RUN_CASES:
                 complete(kit, run, key)
+            settle(kit, run)
         assert kit.runs.transition(run.id, new, stop_reason=stop).status == new
         return
     with pytest.raises(RunError, match="cannot become"):
@@ -380,6 +383,7 @@ def test_a_run_cannot_succeed_while_cases_are_pending_or_unrecorded(kit, store):
         kit.runs.transition(run.id, "succeeded")
     complete(kit, run, "b")
     complete(kit, run, "c")
+    settle(kit, run)
     assert kit.runs.transition(run.id, "succeeded").status == "succeeded"
 
 
@@ -402,6 +406,7 @@ def test_target_failures_count_as_terminal_for_success(kit):
     kit.runs.record_case_result(
         run.id, "c", CaseOutcome.fail(EvalFailure("target", "exception", "boom"))
     )
+    settle(kit, run)
     assert kit.runs.transition(run.id, "succeeded").status == "succeeded"
 
 

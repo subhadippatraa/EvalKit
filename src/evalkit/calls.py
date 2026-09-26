@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
-from evalkit.failures import EvalFailure, FailureClass
+from evalkit.failures import EvalFailure, FailureClass, check_kind
 from evalkit.llm import LLMResponse
 from evalkit.runs import RunAttempt
 
@@ -190,30 +190,43 @@ class SpendTotals:
 
 
 class RunGuard:
-    """Shared, thread-safe state that can stop a run: a systemic failure (every case would fail
-    the same way), a tripped breaker (`breaker_threshold` consecutive infrastructure failures with
-    no success between), or an exhausted budget. It only *decides*; the scheduler acts on it."""
+    """Shared, thread-safe state that can stop a run: a systemic failure that keeps repeating (auth,
+    a rejected request, quota: every case would fail the same way), a tripped breaker
+    (`breaker_threshold` consecutive infrastructure failures with no success between), or an
+    exhausted budget. It only *decides*; the scheduler acts on it.
+
+    A systemic failure is only *suspected* the first time: one rejected request (an over-long
+    input, say) among thousands is that case's problem. The run stops when `systemic_threshold`
+    failures of the same systemic kind follow each other from the same provider and model with no
+    success of that provider and model in between (design 8.4). A success elsewhere (a callable
+    target that keeps working) does not mask a broken judge."""
 
     def __init__(
         self,
         budget: Budget | None = None,
         breaker_threshold: int = 10,
         monotonic: Callable[[], float] = time.monotonic,
+        systemic_threshold: int = 3,
     ):
-        if (
-            isinstance(breaker_threshold, bool)
-            or not isinstance(breaker_threshold, int)
-            or breaker_threshold < 1
+        for name, value in (
+            ("breaker_threshold", breaker_threshold),
+            ("systemic_threshold", systemic_threshold),
         ):
-            raise ValueError("breaker_threshold must be an integer >= 1")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be an integer >= 1")
         self.budget = budget or Budget()
         self.breaker_threshold = breaker_threshold
+        self.systemic_threshold = systemic_threshold
         self._monotonic = monotonic
         self._start = monotonic()
         self._lock = threading.Lock()
         self.usage = SpendTotals()
         self._consecutive_infra = 0
+        self._systemic: dict[tuple[str | None, str | None], tuple[str, int]] = {}
+        self._success_seq: dict[tuple[str | None, str | None], int] = {}
+        self._seq = 0
         self._abort: tuple[str, str] | None = None  # (run status, stop_reason)
+        self.abort_detail: str | None = None  # the message of the failure that tripped the abort
 
     def record(self, attempt: RunAttempt) -> None:
         with self._lock:
@@ -221,8 +234,12 @@ class RunGuard:
             u.calls += 1
             u.input_tokens += attempt.input_tokens or 0
             u.output_tokens += attempt.output_tokens or 0
+            key = (attempt.provider, attempt.model)
             if attempt.outcome == "ok":
                 self._consecutive_infra = 0
+                self._systemic.pop(key, None)
+                self._seq += 1
+                self._success_seq[key] = self._seq
                 return
             u.failed_calls += 1
             if attempt.error_class is FailureClass.INFRA:
@@ -231,14 +248,23 @@ class RunGuard:
                     self._abort = ("partial", "provider_outage")
             else:
                 self._consecutive_infra = 0
+            if attempt.error_class is not None and attempt.error_kind is not None:
+                if check_kind(attempt.error_class, attempt.error_kind).systemic:
+                    kind = f"{attempt.error_class.value}.{attempt.error_kind}"
+                    seen_kind, n = self._systemic.get(key, (kind, 0))
+                    n = n + 1 if seen_kind == kind else 1
+                    self._systemic[key] = (kind, n)
+                    if n >= self.systemic_threshold and (
+                        self._abort is None or self._abort[0] != "failed"
+                    ):
+                        self._abort = ("failed", kind)
+                        self.abort_detail = attempt.error
 
-    def note_failure(self, f: EvalFailure) -> None:
-        """A systemic failure stops the run at once (design 8.4): retrying it cannot help and the
-        next N cases would each pay for the same failure."""
-        if f.systemic:
-            with self._lock:
-                if self._abort is None or self._abort[0] != "failed":
-                    self._abort = ("failed", f"{f.failure_class.value}.{f.kind}")
+    def success_seq(self, provider: str | None, model: str | None) -> int:
+        """A counter that grows with every success of this provider and model: a failure recorded
+        at count `k` is *proven* case-specific once the count exceeds `k`."""
+        with self._lock:
+            return self._success_seq.get((provider, model), 0)
 
     @property
     def abort(self) -> tuple[str, str] | None:
@@ -329,7 +355,6 @@ class UnitCalls:
                 value = validate(resp) if validate is not None else resp
             except EvalFailure as f:
                 self._record_failure(f, started_at, t0, provider, model)
-                r.guard.note_failure(f)
                 if (
                     f.failure_class is FailureClass.EVALUATOR
                     and f.kind == "invalid_output"

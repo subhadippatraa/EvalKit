@@ -141,6 +141,16 @@ class SQLiteStore(DatasetStoreMixin, RunStoreMixin, AnalysisStoreMixin):
     def spill_dir(self) -> Path | None:
         return None if self.path is None else self.path.with_name(f"{self.path.name}.spill")
 
+    @property
+    def lock_dir(self) -> Path | None:
+        """Where run locks live (see evalkit.runlock); None for an in-memory database."""
+        return None if self.path is None else self.path.with_name(f"{self.path.name}.locks")
+
+    @property
+    def lock_scope(self) -> str:
+        """What a run id is unique within, for the in-process lock registry."""
+        return f"mem:{id(self)}" if self.path is None else str(self.path.resolve())
+
     def close(self) -> None:
         self._conn.close()
 

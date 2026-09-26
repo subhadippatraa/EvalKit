@@ -42,6 +42,7 @@ def test_released_migrations_are_never_edited_and_this_one_is_pinned():
         "7deb3512a5db0e0ea827ee131deb02a4df73244b0ca00edc15e2009f53495bba",  # 3 datasets
         "75809807771611ba08018eb50753cfdddfba91e4411c0af742e6dba5026bb613",  # 4 runs_and_results
         "55838dc14c3feac064f5406dff88e922cf17cf153edb7ce05d5c254d162eb5ed",  # 5 analysis
+        "4017ccad2462e3df52d14970d901ae46117f609d54cd56ac20358a0b2d13d995",  # 6 p1_1_hardening
     ]
     assert [m.version for m in MIGRATIONS] == list(range(1, len(MIGRATIONS) + 1))
     assert MIGRATIONS[3].name == "runs_and_results"
@@ -63,7 +64,7 @@ def test_a_fresh_database_gets_the_run_schema(tmp_path):
     assert columns(path, "case_results") == {
         "id", "run_id", "case_id", "status", "output", "retrieved_json", "failure_class",
         "failure_kind", "failure_message", "retryable", "created_at", "started_at", "finished_at",
-        "duration_ms", "ord",
+        "duration_ms", "ord", "meta_json",
     }  # fmt: skip
     assert columns(path, "evaluator_results") == {
         "id", "case_result_id", "run_id", "evaluator_key", "status", "verdict", "detail_json",
@@ -142,19 +143,56 @@ def test_reopening_is_idempotent_and_makes_no_backup(tmp_path):
 # --- upgrades --------------------------------------------------------------------------------
 
 
-def test_a_dataset_foundation_database_upgrades_with_its_datasets_intact(tmp_path, monkeypatch):
+def seed_dataset_at_migration_3(path, name, cases):
+    """A database exactly as the dataset-foundation release left it (migrations 1-3), holding one
+    sealed dataset version, written with the SQL of that release (no `input_hash`)."""
+    import json
+    import uuid
+
+    from evalkit.datasets import EvaluationCase
+    from evalkit.hashing import dataset_hash
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    migrate(conn, path=path, backup=False, migrations=MIGRATIONS[:3])
+    dataset_id, version_id = str(uuid.uuid4()), str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO datasets VALUES (?, ?, NULL, '2026-01-01T00:00:00+00:00')", (dataset_id, name)
+    )
+    conn.execute(
+        "INSERT INTO dataset_versions (id, dataset_id, version_no, created_at) "
+        "VALUES (?,?,1,'2026-01-01T00:00:00+00:00')",
+        (version_id, dataset_id),
+    )
+    pairs = []
+    for raw in sorted(cases, key=lambda c: c["case_key"]):
+        c = EvaluationCase(**raw)
+        conn.execute(
+            "INSERT INTO cases (id, dataset_version_id, case_key, content_hash, prompt, output, "
+            "reference, context, retrieved_json, relevance_json, metadata_json, tags_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), version_id, c.case_key, c.content_hash, c.prompt, c.output,
+             c.reference, c.context, json.dumps(c.retrieved) if c.retrieved is not None else None,
+                json.dumps(c.relevance) if c.relevance is not None else None,
+                json.dumps(c.metadata), json.dumps(c.tags)),
+        )  # fmt: skip
+        pairs.append((c.case_key, c.content_hash))
+    content_hash = dataset_hash(pairs)
+    conn.execute(
+        "UPDATE dataset_versions SET content_hash = ?, case_count = ?, sealed = 1 WHERE id = ?",
+        (content_hash, len(pairs), version_id),
+    )
+    conn.commit()
+    conn.close()
+    return content_hash
+
+
+def test_a_dataset_foundation_database_upgrades_with_its_datasets_intact(tmp_path):
     """The database exactly as the previous release left it: real datasets, no runs tables."""
     path = tmp_path / "p1a.db"
-    with monkeypatch.context() as previous_release:
-        previous_release.setattr(
-            "evalkit.store.migrate",
-            lambda conn, **kw: migrate(conn, migrations=MIGRATIONS[:3], **kw),
-        )
-        old = SQLiteStore(path)
-        imported = EvalKit(old).datasets.import_cases(
-            "qa", [case("a", output="x"), case("b", output="y")]
-        )
-        old.close()
+    content_hash = seed_dataset_at_migration_3(
+        path, "qa", [case("a", output="x"), case("b", output="y")]
+    )
     assert applied(path) == [1, 2, 3]
     assert not NEW_TABLES & {
         r[0]
@@ -165,7 +203,7 @@ def test_a_dataset_foundation_database_upgrades_with_its_datasets_intact(tmp_pat
     assert applied(path) == ALL
     kit = EvalKit(store)
     assert kit.datasets.verify("qa").ok  # hashes still verify: nothing about datasets moved
-    assert kit.datasets.resolve("qa").content_hash == imported.version.content_hash
+    assert kit.datasets.resolve("qa").content_hash == content_hash
     assert len(list(tmp_path.glob("p1a.db.bak-v3-*"))) == 1  # backed up before the change
     run = make_run(kit, EM, start=True)  # runs work on the pre-existing dataset
     kit.runs.record_evaluator_result(complete(kit, run, "a").id, ok(EM.key))
@@ -298,7 +336,7 @@ def test_editing_migration_4_after_it_was_applied_is_detected(tmp_path):
     edited = (
         *MIGRATIONS[:3],
         Migration(4, "runs_and_results", RUNS_SQL + "\n-- edited"),
-        MIGRATIONS[4],
+        *MIGRATIONS[4:],
     )
     with pytest.raises(MigrationError, match="was modified after it was applied"):
         migrate(conn, path=path, backup=False, migrations=edited)

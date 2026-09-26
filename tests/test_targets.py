@@ -393,7 +393,7 @@ def test_a_model_target_retries_throttling_and_records_every_call():
 def test_a_bad_model_id_is_input_bad_config_and_systemic_for_a_target():
     from evalkit.calls import RunGuard
 
-    guard = RunGuard()
+    guard = RunGuard(systemic_threshold=1)
     runner = CallRunner(RetryPolicy(base_s=0.001, cap_s=0.002), guard=guard)
     bad = EvalFailure("input", "bad_config", "Bedrock ResourceNotFoundException: no such model")
     with pytest.raises(EvalFailure) as info:

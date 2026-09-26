@@ -535,6 +535,73 @@ BEGIN SELECT RAISE(ABORT, 'judge checks are permanent records'); END;
 """
 
 
+# P1.1 hardening (audit of the P1 platform).
+#  * cases.input_hash: what a case *asks* (prompt, context, reference, relevance), without the
+#    system's output. Comparison pairs on it; pairing on the full content hash silently dropped
+#    every case whose output had changed (audit P0-1). Backfilled below for existing versions.
+#  * case_results.meta_json: what the target reported about its output (stop reason, truncation).
+#  * a run only succeeds when every case is terminal AND every terminal case has all of the run's
+#    evaluator results (a `succeeded` run with no evaluator results is not a measurement).
+#  * a pending case result carries its processing order (paging by (ord, id) needs it).
+HARDENING_SQL = """
+ALTER TABLE cases ADD COLUMN input_hash TEXT;
+ALTER TABLE case_results ADD COLUMN meta_json TEXT;
+
+DROP TRIGGER runs_succeeded_needs_every_case;
+CREATE TRIGGER runs_succeeded_needs_every_case BEFORE UPDATE ON runs
+WHEN NEW.status = 'succeeded'
+  AND (
+    (SELECT COUNT(*) FROM case_results WHERE run_id = OLD.id AND status <> 'pending')
+      <> (SELECT case_count FROM dataset_versions WHERE id = OLD.dataset_version_id)
+    OR (SELECT COUNT(*) FROM evaluator_results WHERE run_id = OLD.id)
+      <> (SELECT COUNT(*) FROM case_results WHERE run_id = OLD.id AND status <> 'pending')
+         * OLD.evaluator_count
+  )
+BEGIN SELECT RAISE(ABORT,
+  'a run succeeds only when every case has a terminal result and every evaluator result'); END;
+
+CREATE TRIGGER case_results_pending_is_ordered BEFORE INSERT ON case_results
+WHEN NEW.status = 'pending' AND NEW.ord IS NULL
+BEGIN SELECT RAISE(ABORT, 'a pending case result needs its processing order'); END;
+
+CREATE TRIGGER case_results_meta_insert BEFORE INSERT ON case_results
+WHEN NEW.meta_json IS NOT NULL AND NEW.status <> 'complete'
+BEGIN SELECT RAISE(ABORT, 'only a complete case result carries output metadata'); END;
+
+CREATE TRIGGER case_results_meta_update BEFORE UPDATE ON case_results
+WHEN NEW.meta_json IS NOT NULL AND NEW.status <> 'complete'
+BEGIN SELECT RAISE(ABORT, 'only a complete case result carries output metadata'); END;
+"""
+
+
+def _backfill_input_hash(conn: sqlite3.Connection) -> None:
+    """Record the input hash of every existing case. Cases are immutable, so the immutability
+    trigger is lifted for exactly this statement and restored in the same transaction (a failure
+    rolls both back)."""
+    import json
+
+    from evalkit.hashing import case_input_hash
+
+    conn.execute("DROP TRIGGER cases_no_update")
+    rows = conn.execute(
+        "SELECT id, prompt, reference, context, relevance_json FROM cases WHERE input_hash IS NULL"
+    ).fetchall()
+    conn.executemany(
+        "UPDATE cases SET input_hash = ? WHERE id = ?",
+        [
+            (
+                case_input_hash(r[1], r[2], r[3], None if r[4] is None else json.loads(r[4])),
+                r[0],
+            )
+            for r in rows
+        ],
+    )
+    conn.execute(
+        "CREATE TRIGGER cases_no_update BEFORE UPDATE ON cases "
+        "BEGIN SELECT RAISE(ABORT, 'cases are immutable'); END"
+    )
+
+
 def _backfill_rubric_versions(conn: sqlite3.Connection) -> None:
     """Register the rubric version -> content hash of every existing row (earliest first wins).
 
@@ -592,6 +659,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(3, "dataset_foundation", DATASETS_SQL),
     Migration(4, "runs_and_results", RUNS_SQL),
     Migration(5, "analysis_foundation", ANALYSIS_SQL),
+    Migration(6, "p1_1_hardening", HARDENING_SQL, _backfill_input_hash),
 )
 
 _V1_EVALUATION_COLUMNS = frozenset(

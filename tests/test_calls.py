@@ -314,8 +314,8 @@ def test_error_type_is_the_wrapped_exception_class():
         (fail("input", "bad_config"), "input.bad_config"),
     ],
 )
-def test_a_systemic_failure_is_not_retried_and_stops_the_run(f, reason):
-    guard = RunGuard()
+def test_a_systemic_failure_is_not_retried_and_stops_the_run_once_it_repeats(f, reason):
+    guard = RunGuard(systemic_threshold=1)  # (the default of 3 is tested in test_systemic_failures)
     r, _, _ = runner(guard=guard)
     send = flaky(f)
     with pytest.raises(EvalFailure):
@@ -397,8 +397,12 @@ def test_target_and_evaluator_failures_do_not_trip_the_breaker():
 
 
 def test_a_systemic_abort_is_not_downgraded_by_a_later_breaker_trip():
-    g = RunGuard(breaker_threshold=1)
-    g.note_failure(fail("infrastructure", "auth"))
+    from datetime import UTC, datetime
+
+    from evalkit import RunAttempt
+
+    g = RunGuard(breaker_threshold=1, systemic_threshold=1)
+    g.record(RunAttempt.failed(1, datetime.now(UTC), 1, fail("infrastructure", "auth")))
     g.record(infra_attempt())
     assert g.abort == ("failed", "infrastructure.auth")
 

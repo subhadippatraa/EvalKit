@@ -66,6 +66,18 @@ def build_run(
             ),
         )  # fmt: skip
     if finish:
+        for cr in kit.runs.case_results(run.id):  # evaluators the spec list adds: nothing to score
+            have = {e.evaluator_key for e in kit.runs.evaluator_results(cr.id)}
+            for key in kit.runs.get(run.id).config.evaluator_keys:
+                if key not in have:
+                    kit.runs.record_evaluator_result(
+                        cr.id,
+                        EvaluatorOutcome(
+                            evaluator_key=key,
+                            status="not_applicable" if cr.status == "complete" else "skipped",
+                            detail={"reason": "not scored here"},
+                        ),
+                    )
         kit.runs.transition(run.id, "succeeded")
     return run
 
@@ -164,7 +176,7 @@ def test_no_survivorship_warning_when_coverage_matches(kit):
     assert not any("survivorship" in w for w in cmp.warnings)
 
 
-def test_different_dataset_versions_compare_only_identical_cases(kit):
+def test_different_dataset_versions_pair_by_key_and_input_and_report_what_was_not_paired(kit):
     dataset(kit, 40)
     a = build_run(kit, [1.0] * 40)
     kit.datasets.import_cases(
@@ -173,8 +185,8 @@ def test_different_dataset_versions_compare_only_identical_cases(kit):
             {
                 "case_key": f"c{i:03}",
                 "prompt": "p",
-                "reference": "r",
-                "output": "o" if i < 30 else "changed",
+                "reference": "r" if i < 30 else "a different reference",  # the question changed
+                "output": "another output" if i % 2 else "o",  # outputs may differ freely
             }
             for i in range(40)
         ],
@@ -182,12 +194,26 @@ def test_different_dataset_versions_compare_only_identical_cases(kit):
     b = build_run(kit, [1.0] * 40, ref="qa@2")
     cmp = compare(kit, a.id, b.id)
     assert not cmp.same_dataset_version and cmp.common_cases == 30 and one(cmp).n_paired == 30
-    assert any("different dataset versions" in w for w in cmp.warnings)
+    assert cmp.unpaired == {"input_changed": 10, "only_baseline": 0, "only_candidate": 0}
+    assert any("10 case(s)" in w and "NOT paired" in w for w in cmp.warnings)
+    assert any("different dataset versions" in i for i in cmp.informational)
+
+
+def test_cases_present_in_only_one_run_are_counted_and_warned_about(kit):
+    dataset(kit, 40)
+    a = build_run(kit, [1.0] * 40)
+    kit.datasets.import_cases(
+        "qa", [{"case_key": f"c{i:03}", "prompt": "p", "reference": "r"} for i in range(35)]
+    )
+    b = build_run(kit, [1.0] * 35, ref="qa@2")
+    cmp = compare(kit, a.id, b.id)
+    assert cmp.unpaired == {"input_changed": 0, "only_baseline": 5, "only_candidate": 0}
+    assert any("only in the baseline" in w for w in cmp.warnings)
 
 
 def test_runs_with_nothing_in_common_are_refused(kit):
     dataset(kit, 5, name="one")
-    dataset(kit, 5, name="two", metadata={"x": 1})
+    dataset(kit, 5, name="two", reference="a different reference")
     a = build_run(kit, [1.0] * 5, ref="one")
     b = build_run(kit, [1.0] * 5, ref="two")
     with pytest.raises(ComparisonError, match="no case in common"):

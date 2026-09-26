@@ -33,7 +33,7 @@ def upto(path, n):
 def test_a_fresh_database_gets_the_analysis_schema(tmp_path):
     path = tmp_path / "new.db"
     SQLiteStore(path).close()
-    assert applied(path) == ALL and ALL[-1] == 5 and NEW_TABLES <= tables(path)
+    assert applied(path) == ALL and ALL[-1] == 6 and NEW_TABLES <= tables(path)
     assert columns(path, "reviews") == {
         "id", "evaluation_id", "case_result_id", "evaluator_key", "sample", "reviewer", "score",
         "verdict", "comment", "created_at",
@@ -175,7 +175,7 @@ def test_the_upgraded_and_the_fresh_schema_are_identical(tmp_path):
     stepped = tmp_path / "stepped.db"
     conn = upto(stepped, 1)
     conn.close()
-    for n in (2, 3, 4, 5):
+    for n in range(2, len(MIGRATIONS) + 1):
         conn = sqlite3.connect(stepped)
         conn.row_factory = sqlite3.Row
         migrate(conn, path=stepped, backup=False, migrations=MIGRATIONS[:n])

@@ -42,6 +42,7 @@ ALLOWED = {
     "bedrock": {"errors", "failures", "judge_eval", "llm"},
     "bedrock_openai": {"failures", "judge_eval", "llm", "safejson"},
     "env": {"errors", "llm"},
+    "runlock": {"errors"},
     "analysis": {"runs", "stats"},
     "compare": {"analysis", "errors", "stats"},
     "calibration": {"errors", "limits", "stats"},

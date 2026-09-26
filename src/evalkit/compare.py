@@ -97,6 +97,7 @@ class Comparison:
     informational: list[str]
     same_identity: bool  # the same measurement repeated: differences are run-to-run noise
     exclusions: dict[str, dict[str, int]]
+    unpaired: dict[str, int]  # input_changed | only_baseline | only_candidate: cases not paired
     coverage: dict[str, dict[str, float | None]]
     metrics: list[MetricComparison]
     warnings: list[str]
@@ -168,9 +169,10 @@ def compare(
 
     same_version = base.dataset_version_id == cand.dataset_version_id
     if not same_version and binfo["content_hash"] != cinfo["content_hash"]:
-        warnings.append(
-            f"the runs used different dataset versions ({base.dataset_ref}, {cand.dataset_ref}): "
-            "only cases with the same key AND identical content are compared"
+        info.append(
+            f"the runs used different dataset versions ({base.dataset_ref}, {cand.dataset_ref}); "
+            "cases are paired by key and by their input side (prompt, context, reference, "
+            "relevance labels) -- the outputs may, and usually do, differ"
         )
     if base.config.scoring_version != cand.config.scoring_version:
         confounders.append(
@@ -222,13 +224,36 @@ def compare(
     same_identity = base.identity_hash == cand.identity_hash
 
     b_out, c_out = store.case_outcomes(baseline_id), store.case_outcomes(candidate_id)
+    # Pair on (case_key, input_hash): the question side of the case. The system's own output is
+    # deliberately NOT part of it -- pairing on the full content would drop exactly the cases whose
+    # output changed, i.e. the regressions (audit P0-1).
+    both_keys = b_out.keys() & c_out.keys()
     common = {
         k
-        for k in b_out.keys() & c_out.keys()
-        if b_out[k]["content_hash"] == c_out[k]["content_hash"]
+        for k in both_keys
+        if b_out[k]["input_hash"] is not None and b_out[k]["input_hash"] == c_out[k]["input_hash"]
+    }
+    unpaired = {
+        "input_changed": len(both_keys) - len(common),
+        "only_baseline": len(b_out.keys() - c_out.keys()),
+        "only_candidate": len(c_out.keys() - b_out.keys()),
     }
     if not common:
-        raise ComparisonError("the runs have no case in common (same key and identical content)")
+        raise ComparisonError(
+            "the runs have no case in common (same key and identical prompt, context, reference "
+            "and relevance)"
+        )
+    if unpaired["input_changed"]:
+        warnings.append(
+            f"{unpaired['input_changed']} case(s) share a key but differ in their input (prompt, "
+            "context, reference or relevance) between the runs and were NOT paired"
+        )
+    for side, n in (
+        ("baseline", unpaired["only_baseline"]),
+        ("candidate", unpaired["only_candidate"]),
+    ):
+        if n:
+            warnings.append(f"{n} case(s) exist only in the {side} run and were not paired")
 
     exclusions: dict[str, Counter[str]] = {"baseline": Counter(), "candidate": Counter()}
     metrics: list[MetricComparison] = []
@@ -309,6 +334,7 @@ def compare(
         informational=info,
         same_identity=same_identity,
         exclusions={k: dict(v) for k, v in exclusions.items()},
+        unpaired=unpaired,
         coverage=coverage,
         metrics=metrics,
         warnings=warnings,

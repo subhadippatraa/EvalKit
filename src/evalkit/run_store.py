@@ -273,15 +273,23 @@ class RunStoreMixin:
             return _run_from_row(self._run_row(run_id))
 
     def _require_every_case_terminal(self, conn: sqlite3.Connection, run: sqlite3.Row) -> None:
-        done, total = conn.execute(
-            "SELECT (SELECT COUNT(*) FROM case_results WHERE run_id = ? AND status <> 'pending'), "
-            "case_count FROM dataset_versions WHERE id = ?",
+        done, total, evals = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM case_results WHERE run_id = ?1 AND status <> 'pending'), "
+            "case_count, (SELECT COUNT(*) FROM evaluator_results WHERE run_id = ?1) "
+            "FROM dataset_versions WHERE id = ?2",
             (run["id"], run["dataset_version_id"]),
         ).fetchone()
         if done != total:
             raise RunError(
                 f"a run succeeds only when every case has a terminal result "
                 f"({done} of {total} have one); stop it as partial instead"
+            )
+        expected = done * run["evaluator_count"]
+        if evals != expected:
+            raise RunError(
+                f"a run succeeds only when every terminal case has an evaluator result for each "
+                f"of its {run['evaluator_count']} evaluator(s) ({evals} of {expected} exist); "
+                "stop it as partial instead"
             )
 
     # -- writing results ------------------------------------------------------------------
@@ -524,11 +532,13 @@ class RunStoreMixin:
                     )
 
     def pending_units(self, run_id: str, n_evaluators: int) -> list[Unit]:
-        """Complete case results still missing evaluator results (crash recovery)."""
+        """Terminal case results still missing evaluator results (crash recovery): complete ones
+        missing real results, and failed ones missing their `skipped` rows."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT r.id, r.output, r.retrieved_json, c.case_key FROM case_results r "
-                "JOIN cases c ON c.id = r.case_id WHERE r.run_id = ? AND r.status = 'complete' "
+                "SELECT r.id, r.status, r.output, r.retrieved_json, c.case_key FROM case_results r "
+                "JOIN cases c ON c.id = r.case_id WHERE r.run_id = ? "
+                "AND r.status IN ('complete', 'failed') "
                 "AND (SELECT COUNT(*) FROM evaluator_results e WHERE e.case_result_id = r.id) < ? "
                 "ORDER BY COALESCE(r.ord, 0), r.id",
                 (run_id, n_evaluators),
@@ -537,7 +547,7 @@ class RunStoreMixin:
             Unit(
                 r["id"],
                 r["case_key"],
-                "complete",
+                r["status"],
                 r["output"],
                 None if r["retrieved_json"] is None else json.loads(r["retrieved_json"]),
             )
@@ -886,4 +896,10 @@ class RunStoreMixin:
                 )
                 if done != case_count:
                     problem(f"run is succeeded but {done} of {case_count} cases have results")
+                evals = count("SELECT COUNT(*) FROM evaluator_results WHERE run_id = ?", run_id)
+                if evals != done * row["evaluator_count"]:
+                    problem(
+                        f"run is succeeded but has {evals} evaluator result(s), expected "
+                        f"{done * row['evaluator_count']} (evaluators x terminal cases)"
+                    )
         return RunVerifyReport(ok=not problems, problems=problems)

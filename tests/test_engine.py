@@ -394,9 +394,9 @@ def test_resuming_after_the_cause_is_fixed_finishes_only_what_is_left(kit):
     assert counts.pending == 0 and counts.complete == 20
     after = {r.case_key: r.id for r in kit.runs.case_results(run.id)}
     assert all(after[k] == v for k, v in before.items())  # recorded results were not redone
-    # cases whose judge auth failed once keep that failure (write-once): visible, not retried
-    failed = kit.runs.failures(run.id, failure_class="infrastructure")
-    assert 0 < len(failed) <= 3 and all(f.failure.kind == "auth" for f in failed)
+    # the auth failures that stopped the run were the environment's, not the cases': they were not
+    # recorded as results, so the resume scored those cases instead of keeping a write-once failure
+    assert kit.runs.failures(run.id, failure_class="infrastructure") == []
     assert kit.runs.verify(run.id).ok
 
 
@@ -891,7 +891,9 @@ def test_execution_policy_defaults():
 def test_a_systemic_failure_outranks_a_simultaneous_cancellation(kit):
     dataset(kit, 20)
     judge = Judge(lambda n, req: EvalFailure("infrastructure", "auth", "denied"))
-    run = create(kit, evaluators=[judge_spec(judge)], policy={"concurrency": 1})
+    run = create(
+        kit, evaluators=[judge_spec(judge)], policy={"concurrency": 1, "systemic_threshold": 1}
+    )
     token = CancelToken()
     report = kit.controller.execute(
         run.id, clients=[judge], token=token, on_progress=lambda n: token.cancel("user")

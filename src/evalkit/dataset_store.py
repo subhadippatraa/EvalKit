@@ -30,7 +30,7 @@ from evalkit.models import format_validation_error
 _EXAMPLES = 5
 _CASE_COLUMNS = (
     "id, dataset_version_id, case_key, content_hash, prompt, output, reference, context, "
-    "retrieved_json, relevance_json, metadata_json, tags_json"
+    "retrieved_json, relevance_json, metadata_json, tags_json, input_hash"
 )
 
 
@@ -53,6 +53,7 @@ def _stored_case(row: sqlite3.Row) -> StoredCase:
             id=row["id"],
             dataset_version_id=row["dataset_version_id"],
             stored_hash=row["content_hash"],
+            stored_input_hash=row["input_hash"],
             case_key=row["case_key"],
             prompt=row["prompt"],
             output=row["output"],
@@ -124,7 +125,8 @@ class DatasetStoreMixin:
                 for case in cases:
                     try:
                         conn.execute(
-                            f"INSERT INTO cases ({_CASE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            f"INSERT INTO cases ({_CASE_COLUMNS}) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (
                                 str(uuid.uuid4()),
                                 version_id,
@@ -138,6 +140,7 @@ class DatasetStoreMixin:
                                 None if case.relevance is None else json.dumps(case.relevance),
                                 json.dumps(case.metadata, allow_nan=False),
                                 json.dumps(case.tags),
+                                case.input_hash,
                             ),
                         )
                         inserted += 1
@@ -313,6 +316,8 @@ class DatasetStoreMixin:
             pairs.append((case.case_key, case.stored_hash))
             if case.content_hash != case.stored_hash:
                 problem(f"case {case.case_key!r}: content does not match its recorded hash")
+            if case.input_hash != case.stored_input_hash:
+                problem(f"case {case.case_key!r}: input does not match its recorded input hash")
         if count != version.case_count:
             problem(f"case count is {count}, recorded {version.case_count}")
         if dataset_hash(pairs) != version.content_hash:

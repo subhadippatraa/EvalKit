@@ -115,3 +115,24 @@ def refuses(store, sql, params=(), match=None):
     finally:
         if conn.in_transaction:
             conn.rollback()
+
+
+def settle(kit, run):
+    """Give every terminal case result an evaluator result for each of the run's evaluators it
+    does not have yet (`not_applicable`, or `skipped` after a target failure): the completeness a
+    run needs before it may be marked succeeded. Lifecycle tests that hand-record case results
+    call this instead of caring about evaluators."""
+    from evalkit import EvaluatorOutcome
+
+    for cr in kit.runs.case_results(run.id):
+        if cr.status == "pending":
+            continue
+        have = {e.evaluator_key for e in kit.runs.evaluator_results(cr.id)}
+        for key in kit.runs.get(run.id).config.evaluator_keys:
+            if key in have:
+                continue
+            status = "not_applicable" if cr.status == "complete" else "skipped"
+            kit.runs.record_evaluator_result(
+                cr.id,
+                EvaluatorOutcome(evaluator_key=key, status=status, detail={"reason": "test"}),
+            )

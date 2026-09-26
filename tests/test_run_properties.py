@@ -97,8 +97,11 @@ class RunMachine(RuleBasedStateMachine):
     def transition(self, target_status):
         stop = "why" if target_status in ("partial", "failed", "cancelled") else None
         done = sum(1 for s, _ in self.cases.values() if s != "pending")
+        # success needs every case terminal AND every terminal case to have all the evaluators'
+        # results (the P1.1 completeness rule, restated here independently of the implementation)
+        complete_evals = len(self.evals) == done * len(EV_KEYS)
         legal = target_status in TRANSITIONS[self.status] and (
-            target_status != "succeeded" or done == len(KEYS)
+            target_status != "succeeded" or (done == len(KEYS) and complete_evals)
         )
         try:
             got = self.kit.runs.transition(self.run.id, target_status, stop_reason=stop)

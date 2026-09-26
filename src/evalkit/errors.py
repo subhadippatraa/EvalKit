@@ -41,6 +41,10 @@ class RunError(EvalKitError):
     """
 
 
+class RunBusyError(RunError):
+    """Another executor already holds this run (exclusive execution, see evalkit.runlock)."""
+
+
 class DuplicateResultError(RunError):
     """A result already exists for this case (or evaluator) in this run; results are write-once."""
 
