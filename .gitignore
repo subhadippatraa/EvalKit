@@ -17,3 +17,9 @@ build/
 quickstart.db*
 examples/quickstart/compare.json
 examples/quickstart/report.html
+
+# Internal docs (kept locally, not published)
+docs/INTERVIEW-PREP.md
+docs/PRODUCTION-AUDIT.md
+evalkit-prompt.md
+docs/mutation-results.txt
