@@ -217,8 +217,8 @@ compared directly.
 
 ## Datasets
 
-Versioned, immutable collections of evaluation cases (the foundation for comparing runs; runs and
-targets come next). One JSON object per line:
+Versioned, immutable collections of evaluation cases (the foundation for comparing runs). One JSON
+object per line:
 
 ```json
 {"case_key": "q1", "prompt": "What is 2+2?", "output": "4", "reference": "4", "tags": ["math"]}
@@ -452,11 +452,9 @@ evalkit cache stats
   into memory (450 MB at 100K cases).
 - **LLM judges can be talked into a score**; injection is made detectable (golden set, calibration,
   deterministic evaluators), not preventable. The built-in golden set is small and hand-labelled.
-  **Live validation of the judge prompt against a real model is still pending**: the credentials
-  available while developing could not invoke Bedrock models (`ValidationException: Operation not
-  allowed`), so the provider clients are tested against botocore's `Stubber` (real service-model
-  shapes) and the prompts against fakes only; the over-long-input recognition is a heuristic that has
-  not met a live provider.
+  **The judge prompt has not yet been validated against a live model**: the provider clients are
+  tested against botocore's `Stubber` (real service-model shapes) and the prompts against fakes only;
+  the over-long-input recognition is a heuristic that has not met a live provider.
 - Statistics are stdlib-only and stated with their limits: a 60-case dataset cannot show a change
   smaller than about 10 points (comparisons print the minimum detectable difference).
 
