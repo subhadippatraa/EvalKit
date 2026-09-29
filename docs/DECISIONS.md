@@ -9,10 +9,10 @@ Rejected · Cost.**
 ## DR-1. The v1 "out of scope" list is superseded
 
 - **Decision.** Datasets, runs, batch execution, comparison, retrieval and deterministic metrics, and a
-  report are in scope. The original spec (`evalkit-prompt.md`) and the pre-P1 README listed all of
+  report are in scope. The original spec and the pre-P1 README listed all of
   them as out of scope for v1.
 - **Why.** The product goal changed from "a single-call LLM-as-judge library" to "systematically
-  evaluate AI systems and detect regressions" (`PRODUCTION-AUDIT.md` §1, §25).
+  evaluate AI systems and detect regressions".
 - **Still out of scope** (`TARGET-ARCHITECTURE.md` §18): an HTTP API or server, Postgres, brokers,
   microservices, a dashboard, an `http` target, BLEU/ROUGE/embedding metrics, user-code evaluators.
 

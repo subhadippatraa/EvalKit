@@ -1,8 +1,7 @@
 # EvalKit — Target Architecture (Phase 2)
 
-Status: **design only, nothing implemented.** Source of truth for current behavior:
-[`PRODUCTION-AUDIT.md`](PRODUCTION-AUDIT.md) (audited at `99d8def`). Finding IDs (`F-n`) and
-section numbers (`§n` in the audit) are referenced throughout.
+Status: **design document.** Finding IDs (`F-n`) and section numbers (`§n`) refer to an internal
+production audit of `v0.1.0` and are referenced throughout.
 
 Product story this design serves:
 

@@ -1,7 +1,6 @@
 # evalkit — Architecture (v1)
 
-Status: **approved and implemented (v0.1.0).** Source of
-truth for requirements: `evalkit-prompt.md`. All open decisions are resolved
+Status: **approved and implemented (v0.1.0).** All open decisions are resolved
 (see [Resolved Decisions](#resolved-decisions)); references appear as **[OD-n]**.
 
 ## Goals and scope
@@ -502,7 +501,7 @@ changing approved design:
 ## 0.2.0 (P0 hardening) changes
 
 Implements P0 of [`TARGET-ARCHITECTURE.md`](TARGET-ARCHITECTURE.md) for the single-record path;
-findings refer to [`PRODUCTION-AUDIT.md`](PRODUCTION-AUDIT.md). These **supersede** any earlier
+`F-n` labels refer to findings of an internal production audit. These **supersede** any earlier
 statement in this document.
 
 - **Numeric safety (F-1).** `Criterion.weight` is finite and within `[1e-6, 1e6]`; scale bounds are
