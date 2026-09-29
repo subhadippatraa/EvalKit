@@ -44,7 +44,8 @@ def client_from_env(
     if provider == "bedrock":
         from evalkit.bedrock import BedrockClient
 
-        return BedrockClient(model=model, timeout=timeout)
+        # region from the same mapping; None falls back to boto3's own chain
+        return BedrockClient(model=model, timeout=timeout, region=env.get("AWS_DEFAULT_REGION"))
     if provider == "bedrock-openai":
         from evalkit.bedrock_openai import DEFAULT_BASE_URL, BedrockOpenAIClient
 
